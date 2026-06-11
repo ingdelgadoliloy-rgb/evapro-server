@@ -9,15 +9,15 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
-// Sessions: { [sessionId]: { results: [], closures: [], adminClients: Set } }
+// Sessions: { [sessionId]: { results: [], closures: [], examPackage: null, adminClients: Set } }
 const sessions = {};
 
 function getSession(sessionId) {
   if (!sessions[sessionId]) {
-    sessions[sessionId] = { results: [], closures: [], adminClients: new Set() };
+    sessions[sessionId] = { results: [], closures: [], examPackage: null, adminClients: new Set() };
   }
   return sessions[sessionId];
 }
@@ -126,6 +126,52 @@ app.delete("/api/results/:sessionId", (req, res) => {
     broadcast(req.params.sessionId, { type: "cleared" });
   }
   return res.json({ ok: true });
+});
+
+// POST /api/exam/:sessionId  -- teacher publishes the active exam package
+app.post("/api/exam/:sessionId", (req, res) => {
+  const sessionId = req.params.sessionId;
+  const examPackage = req.body?.package || req.body?.examPackage || req.body;
+
+  if (
+    !sessionId ||
+    !examPackage?.schema ||
+    !Array.isArray(examPackage.questionBank) ||
+    examPackage.questionBank.length === 0
+  ) {
+    return res.status(400).json({ error: "Paquete de examen invalido o vacio" });
+  }
+
+  const session = getSession(sessionId);
+  session.examPackage = {
+    ...examPackage,
+    sessionId,
+    receivedAt: new Date().toISOString()
+  };
+
+  broadcast(sessionId, {
+    type: "exam-updated",
+    updatedAt: session.examPackage.receivedAt,
+    questionCount: session.examPackage.questionBank.length
+  });
+
+  return res.json({
+    ok: true,
+    sessionId,
+    questionCount: session.examPackage.questionBank.length,
+    updatedAt: session.examPackage.receivedAt
+  });
+});
+
+// GET /api/exam/:sessionId  -- student downloads the active exam package
+app.get("/api/exam/:sessionId", (req, res) => {
+  const session = sessions[req.params.sessionId];
+
+  if (!session?.examPackage) {
+    return res.status(404).json({ error: "No hay examen publicado para esta sesion" });
+  }
+
+  return res.json({ ok: true, package: session.examPackage });
 });
 
 

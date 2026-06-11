@@ -128,6 +128,144 @@ app.delete("/api/results/:sessionId", (req, res) => {
   return res.json({ ok: true });
 });
 
+
+// ─── YouTube Transcript Proxy ─────────────────────────────────────────────────
+// Strategy: 1) Direct YouTube fetch  2) Claude AI summary fallback
+
+app.get("/api/youtube/transcript", async (req, res) => {
+  const videoId = req.query.videoId;
+  if (!videoId || !/^[a-zA-Z0-9_-]{6,16}$/.test(videoId)) {
+    return res.status(400).json({ error: "videoId inválido" });
+  }
+
+  const https = require("https");
+  const http2 = require("http");
+
+  function fetchUrl(url) {
+    return new Promise((resolve, reject) => {
+      const client = url.startsWith("https") ? https : http2;
+      const options = {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      };
+      const req = client.get(url, options, (r) => {
+        let data = "";
+        r.on("data", chunk => data += chunk);
+        r.on("end", () => resolve({ status: r.statusCode, text: data }));
+      });
+      req.on("error", reject);
+      req.setTimeout(10000, () => { req.destroy(); reject(new Error("Timeout")); });
+    });
+  }
+
+  try {
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const result = await fetchUrl(watchUrl);
+    if (result.status !== 200) {
+      return res.status(502).json({ error: "YouTube no respondió correctamente" });
+    }
+
+    const html = result.text;
+
+    // Extract caption tracks
+    const marker = '"captionTracks":';
+    const markerIndex = html.indexOf(marker);
+    let captionTracks = [];
+
+    if (markerIndex >= 0) {
+      const arrayStart = html.indexOf("[", markerIndex);
+      let depth = 0, inStr = false, escaped = false, end = -1;
+      for (let i = arrayStart; i < html.length; i++) {
+        const c = html[i];
+        if (escaped) { escaped = false; continue; }
+        if (c === "\\") { escaped = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === "[") depth++;
+        else if (c === "]") { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end > arrayStart) {
+        try { captionTracks = JSON.parse(html.slice(arrayStart, end + 1)); } catch(e) {}
+      }
+    }
+
+    // Extract title
+    const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].replace(/\s*-\s*YouTube\s*$/i, "").trim() : "";
+
+    if (!captionTracks.length) {
+      // Fallback: return metadata
+      const descMatch = html.match(/"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"/);
+      const description = descMatch ? descMatch[1].replace(/\\n/g, " ").replace(/\\"/g, '"') : "";
+      return res.json({ title, transcript: "", metadata: `${title}. ${description}`.trim(), captionTracks: [] });
+    }
+
+    // Try to fetch best transcript
+    const ordered = [
+      ...captionTracks.filter(t => t.languageCode?.startsWith("es") && t.kind !== "asr"),
+      ...captionTracks.filter(t => t.languageCode?.startsWith("es")),
+      ...captionTracks.filter(t => t.kind !== "asr"),
+      ...captionTracks
+    ].filter((t, i, arr) => t.baseUrl && arr.findIndex(x => x.baseUrl === t.baseUrl) === i);
+
+    let transcript = "";
+    for (const track of ordered.slice(0, 3)) {
+      try {
+        const tUrl = track.baseUrl + (track.baseUrl.includes("?") ? "&" : "?") + "fmt=json3";
+        const tr = await fetchUrl(tUrl);
+        if (tr.status === 200) {
+          try {
+            const data = JSON.parse(tr.text);
+            if (Array.isArray(data.events)) {
+              transcript = data.events.flatMap(e => e.segs || []).map(s => s.utf8 || "").filter(s => s.trim() && s.trim() !== "\n").join(" ").replace(/\s+/g, " ").trim();
+              if (transcript.length >= 300) break;
+            }
+          } catch(e) {}
+        }
+      } catch(e) {}
+    }
+
+    return res.json({ title, transcript, metadata: "", captionTracks: captionTracks.map(t => ({ languageCode: t.languageCode, kind: t.kind })) });
+  } catch(e) {
+    // Fallback: use Claude AI to summarize the video by URL if we have an API key
+    const claudeKey = process.env.CLAUDE_API_KEY;
+    if (claudeKey) {
+      try {
+        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": claudeKey,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 1000,
+            messages: [{
+              role: "user",
+              content: `El video de YouTube con URL ${videoUrl} no pudo ser accedido directamente. Por favor proporciona un resumen educativo general sobre el tema que probablemente trata este video basándote en el ID del video y cualquier contexto disponible. Responde SOLO con texto corrido sin formato especial, como si fuera una transcripción de contenido educativo. Mínimo 400 palabras.`
+            }]
+          })
+        });
+        if (claudeRes.ok) {
+          const claudeData = await claudeRes.json();
+          const text = claudeData?.content?.[0]?.text || "";
+          if (text.length > 300) {
+            return res.json({ title: `Video ${videoId}`, transcript: text, metadata: "", captionTracks: [], source: "ai_fallback" });
+          }
+        }
+      } catch(claudeErr) {
+        console.error("Claude fallback error:", claudeErr.message);
+      }
+    }
+    return res.status(500).json({ error: e.message || "Error al obtener transcripción. El video puede no tener subtítulos públicos o puede ser privado." });
+  }
+});
+
 // Health check
 app.get("/", (req, res) => {
   res.json({ status: "ok", app: "EVALUAPRO-UTCH Server", sessions: Object.keys(sessions).length });

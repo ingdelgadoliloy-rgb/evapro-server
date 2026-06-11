@@ -7,3 +7,5 @@ services:
     envVars:
       - key: PORT
         value: 3000
+      - key: CLAUDE_API_KEY
+        sync: false

@@ -33,6 +33,7 @@ Servidor de sincronización en tiempo real para el aplicativo EVALUAPRO-UTCH.
 | POST | `/api/result` | Estudiante envía resultado |
 | POST | `/api/closure` | Estudiante envía cierre |
 | GET | `/api/results/:sessionId` | Docente consulta resultados |
+| GET | `/api/attempt-status/:sessionId/:doc` | Consulta si un estudiante ya presento el examen |
 | DELETE | `/api/results/:sessionId` | Docente borra resultados |
 | POST | `/api/exam/:sessionId` | Docente publica el examen activo |
 | GET | `/api/exam/:sessionId` | Estudiante descarga el examen activo |

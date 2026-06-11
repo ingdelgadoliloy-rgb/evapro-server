@@ -33,6 +33,20 @@ function broadcast(sessionId, message) {
   });
 }
 
+function normalizeDocument(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\D/g, "");
+}
+
+function findAttemptByDoc(session, doc) {
+  const normalizedDoc = normalizeDocument(doc);
+  if (!session || !normalizedDoc) return null;
+  return [...session.results, ...session.closures]
+    .find((entry) => normalizeDocument(entry?.doc) === normalizedDoc) || null;
+}
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
@@ -71,6 +85,13 @@ app.post("/api/result", (req, res) => {
   }
 
   const session = getSession(sessionId);
+  const normalizedDoc = normalizeDocument(entry.doc);
+  const previousResult = session.results.find((r) => normalizeDocument(r.doc) === normalizedDoc);
+  const previousClosure = session.closures.find((c) => normalizeDocument(c.doc) === normalizedDoc && c.date !== entry.date);
+
+  if (previousResult || previousClosure) {
+    return res.json({ ok: true, duplicate: true, blocked: true });
+  }
 
   // Deduplicate: same doc + same date = same result
   const isDuplicate = session.results.some(
@@ -97,6 +118,13 @@ app.post("/api/closure", (req, res) => {
   }
 
   const session = getSession(sessionId);
+  const normalizedDoc = normalizeDocument(entry.doc);
+  const previousClosure = session.closures.find((c) => normalizeDocument(c.doc) === normalizedDoc);
+  const previousResult = session.results.find((r) => normalizeDocument(r.doc) === normalizedDoc && r.date !== entry.date);
+
+  if (previousClosure || previousResult) {
+    return res.json({ ok: true, duplicate: true, blocked: true });
+  }
 
   const isDuplicate = session.closures.some(
     (c) => c.doc === entry.doc && c.date === entry.date
@@ -116,6 +144,17 @@ app.get("/api/results/:sessionId", (req, res) => {
   const session = sessions[req.params.sessionId];
   if (!session) return res.json({ results: [], closures: [] });
   return res.json({ results: session.results, closures: session.closures });
+});
+
+// GET /api/attempt-status/:sessionId/:doc  -- checks whether a student already submitted this exam
+app.get("/api/attempt-status/:sessionId/:doc", (req, res) => {
+  const session = sessions[req.params.sessionId];
+  const entry = findAttemptByDoc(session, req.params.doc);
+  return res.json({
+    ok: true,
+    blocked: Boolean(entry),
+    entry: entry || null
+  });
 });
 
 // DELETE /api/results/:sessionId  — admin clears results

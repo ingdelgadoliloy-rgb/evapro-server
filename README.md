@@ -1,56 +1,50 @@
-# EVALUAPRO-UTCH Server
+# EVALUAPRO-UTCH — Servidor (Render)
 
-Servidor de sincronización en tiempo real para el aplicativo EVALUAPRO-UTCH.
+Servidor WebSocket + REST para sincronización de resultados en tiempo real.
 
-## Funcionalidades
-- Recibe resultados de estudiantes desde cualquier red (WiFi, datos móviles)
-- Transmite resultados al docente en tiempo real via WebSocket
-- Guarda el examen activo del docente para que el estudiante lo cargue desde cualquier dispositivo
-- Aisla examenes, resultados, bloqueos y cierres por `tenantId` para soportar varios docentes en simultaneo
-- Proxy para transcripciones de YouTube (evita bloqueos CORS del navegador)
-- Deduplicación automática de resultados
+## Variables de entorno (Render → Environment)
 
-## Despliegue en Render (gratis)
+| Variable | Requerida | Descripción |
+|---|---|---|
+| `PORT` | No | Puerto (Render lo asigna automáticamente) |
+| `ADMIN_SECRET` | **Sí** | Clave secreta para endpoints admin (DELETE results, POST teachers). Configura un valor aleatorio largo. |
+| `ALLOWED_ORIGINS` | **Sí** | URLs de Netlify permitidas, separadas por coma. Ej: `https://evaluapro-utch.netlify.app` |
+| `CLAUDE_API_KEY` | No | Clave Claude para fallback de YouTube transcripts |
 
-1. Sube este código a un repositorio de GitHub
-2. Ve a https://render.com → New Web Service → conecta el repo
-3. Render detecta el `render.yaml` automáticamente
-4. En **Environment Variables**, agrega:
-   - `CLAUDE_API_KEY` = tu clave de Anthropic (`sk-ant-...`) — opcional, mejora el proxy de YouTube
-5. Deploy → en ~2 minutos tendrás tu URL pública
+## Seguridad aplicada v2.1
 
-## Variables de entorno
+- **Rate limiting**: 30 req/min por IP para resultados; 20 para publicar examen; 10 para docentes.
+- **ADMIN_SECRET**: endpoints destructivos (DELETE, POST /teachers, POST /exam) requieren header `x-admin-secret`.
+- **CORS**: solo origenes configurados en `ALLOWED_ORIGINS`.
+- **Cabeceras HTTP**: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, X-XSS-Protection.
+- **Sanitización**: todos los payloads de entrada son validados y recortados.
+- **Límites**: máx. 500 sesiones, 300 resultados/sesión, 200 preguntas/paquete.
+- **TTL sesiones**: sesiones inactivas por más de 12h se eliminan automáticamente.
+- **Sin claves AI en servidor**: el servidor elimina geminiApiKey/claudeApiKey de los paquetes antes de almacenarlos.
 
-| Variable | Descripción | Requerido |
-|----------|-------------|-----------|
-| `PORT` | Puerto del servidor (default: 3000) | No |
-| `CLAUDE_API_KEY` | Clave API de Anthropic para proxy YouTube | No |
+## Configurar en Render
+
+1. Crea un **Web Service** nuevo en https://render.com
+2. Conecta este repositorio
+3. Build command: `npm install`
+4. Start command: `npm start`
+5. En **Environment**, agrega:
+   - `ADMIN_SECRET` → genera con `openssl rand -hex 32`
+   - `ALLOWED_ORIGINS` → `https://TU-SITIO.netlify.app`
+   - `CLAUDE_API_KEY` → (opcional)
 
 ## Endpoints
 
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| GET | `/` | Health check |
-| POST | `/api/result` | Estudiante envía resultado |
-| POST | `/api/closure` | Estudiante envía cierre |
-| GET | `/api/results/:sessionId` | Docente consulta resultados |
-| GET | `/api/attempt-status/:sessionId/:doc` | Consulta si un estudiante ya presento el examen |
-| DELETE | `/api/results/:sessionId` | Docente borra resultados |
-| POST | `/api/exam/:sessionId` | Docente publica el examen activo |
-| GET | `/api/exam/:sessionId` | Estudiante descarga el examen activo |
-| GET | `/api/youtube/transcript?videoId=X` | Proxy transcripción YouTube |
-
-Endpoints docentes:
-- `POST /api/teachers/:adminId`: publica la lista de docentes autorizados del admin.
-- `GET /api/teacher-access/:adminId/:token`: valida el link de acceso docente.
-
-Los endpoints de examen y resultados aceptan `tenantId` por query string, body JSON o header `x-tenant-id`. Si no se envia, se usa `default` para mantener compatibilidad con enlaces antiguos.
-
-## WebSocket
-
-Conectar como admin: `wss://tu-server.onrender.com/ws?sessionId=XXX&tenantId=DOCENTE_1&role=admin`
-
-Mensajes recibidos:
-- `{ type: "init", results: [...], closures: [...] }` — al conectar
-- `{ type: "result", entry: {...} }` — resultado nuevo en tiempo real  
-- `{ type: "cleared" }` — ranking borrado por admin
+| Método | Ruta | Auth |
+|---|---|---|
+| `GET` | `/` | Pública |
+| `GET` | `/api/exam/:sessionId` | Pública |
+| `POST` | `/api/exam/:sessionId` | Abierta (rate limited) |
+| `POST` | `/api/result` | Abierta (rate limited) |
+| `POST` | `/api/closure` | Abierta (rate limited) |
+| `GET` | `/api/results/:sessionId` | Pública |
+| `GET` | `/api/attempt-status/:sessionId/:doc` | Pública |
+| `DELETE` | `/api/results/:sessionId` | **ADMIN_SECRET** |
+| `POST` | `/api/teachers/:adminId` | **ADMIN_SECRET** |
+| `GET` | `/api/teacher-access/:adminId/:token` | Pública |
+| `GET` | `/api/youtube/transcript` | Pública (rate limited) |

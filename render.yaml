@@ -9,3 +9,7 @@ services:
         value: 3000
       - key: CLAUDE_API_KEY
         sync: false
+      - key: ADMIN_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "https://evaluapro-utch.netlify.app,https://cartografia-examen.netlify.app"

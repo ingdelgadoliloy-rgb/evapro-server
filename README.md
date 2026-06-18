@@ -6,6 +6,7 @@ Servidor de sincronización en tiempo real para el aplicativo EVALUAPRO-UTCH.
 - Recibe resultados de estudiantes desde cualquier red (WiFi, datos móviles)
 - Transmite resultados al docente en tiempo real via WebSocket
 - Guarda el examen activo del docente para que el estudiante lo cargue desde cualquier dispositivo
+- Aisla examenes, resultados, bloqueos y cierres por `tenantId` para soportar varios docentes en simultaneo
 - Proxy para transcripciones de YouTube (evita bloqueos CORS del navegador)
 - Deduplicación automática de resultados
 
@@ -39,9 +40,15 @@ Servidor de sincronización en tiempo real para el aplicativo EVALUAPRO-UTCH.
 | GET | `/api/exam/:sessionId` | Estudiante descarga el examen activo |
 | GET | `/api/youtube/transcript?videoId=X` | Proxy transcripción YouTube |
 
+Endpoints docentes:
+- `POST /api/teachers/:adminId`: publica la lista de docentes autorizados del admin.
+- `GET /api/teacher-access/:adminId/:token`: valida el link de acceso docente.
+
+Los endpoints de examen y resultados aceptan `tenantId` por query string, body JSON o header `x-tenant-id`. Si no se envia, se usa `default` para mantener compatibilidad con enlaces antiguos.
+
 ## WebSocket
 
-Conectar como admin: `wss://tu-server.onrender.com/ws?sessionId=XXX&role=admin`
+Conectar como admin: `wss://tu-server.onrender.com/ws?sessionId=XXX&tenantId=DOCENTE_1&role=admin`
 
 Mensajes recibidos:
 - `{ type: "init", results: [...], closures: [...] }` — al conectar

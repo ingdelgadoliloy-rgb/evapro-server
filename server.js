@@ -12,20 +12,58 @@ app.use(cors());
 app.use(express.json({ limit: "8mb" }));
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
-// Sessions: { [sessionId]: { results: [], closures: [], examPackage: null, adminClients: Set } }
+// Sessions: { [tenantId::sessionId]: { tenantId, sessionId, results: [], closures: [], examPackage: null, adminClients: Set } }
 const sessions = {};
+const teacherRegistries = {};
+const DEFAULT_TENANT_ID = "default";
 
-function getSession(sessionId) {
-  if (!sessions[sessionId]) {
-    sessions[sessionId] = { results: [], closures: [], examPackage: null, adminClients: new Set() };
-  }
-  return sessions[sessionId];
+function normalizeTenantId(value) {
+  const clean = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return clean || DEFAULT_TENANT_ID;
 }
 
-function broadcast(sessionId, message) {
-  const session = sessions[sessionId];
+function getTenantIdFromRequest(req, fallback = "") {
+  return normalizeTenantId(
+    req.query?.tenantId ||
+    req.body?.tenantId ||
+    req.headers?.["x-tenant-id"] ||
+    fallback
+  );
+}
+
+function sessionKey(tenantId, sessionId) {
+  return `${normalizeTenantId(tenantId)}::${String(sessionId || "").trim()}`;
+}
+
+function getSession(tenantId, sessionId) {
+  const key = sessionKey(tenantId, sessionId);
+  if (!sessions[key]) {
+    sessions[key] = {
+      tenantId: normalizeTenantId(tenantId),
+      sessionId: String(sessionId || "").trim(),
+      results: [],
+      closures: [],
+      examPackage: null,
+      adminClients: new Set()
+    };
+  }
+  return sessions[key];
+}
+
+function readSession(tenantId, sessionId) {
+  return sessions[sessionKey(tenantId, sessionId)] || null;
+}
+
+function broadcast(tenantId, sessionId, message) {
+  const session = readSession(tenantId, sessionId);
   if (!session) return;
-  const payload = JSON.stringify(message);
+  const payload = JSON.stringify({ tenantId: session.tenantId, sessionId: session.sessionId, ...message });
   session.adminClients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(payload);
@@ -47,10 +85,51 @@ function findAttemptByDoc(session, doc) {
     .find((entry) => normalizeDocument(entry?.doc) === normalizedDoc) || null;
 }
 
+function normalizeTeacherRecord(teacher) {
+  const name = String(teacher?.name || "").trim();
+  const doc = normalizeDocument(teacher?.doc);
+  const token = String(teacher?.token || "").trim();
+  const tenantId = normalizeTenantId(teacher?.tenantId || `doc-${doc || token}`);
+  if (!name || doc.length < 5 || token.length < 10) {
+    return null;
+  }
+  return {
+    name,
+    doc,
+    token,
+    tenantId,
+    active: teacher?.active !== false
+  };
+}
+
+function normalizeTeacherList(value) {
+  const seen = new Set();
+  return (Array.isArray(value) ? value : [])
+    .map(normalizeTeacherRecord)
+    .filter(Boolean)
+    .filter((teacher) => {
+      const key = teacher.token || teacher.doc;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function publicTeacherRecord(teacher, adminId) {
+  return {
+    name: teacher.name,
+    doc: teacher.doc,
+    tenantId: teacher.tenantId,
+    adminId,
+    active: teacher.active
+  };
+}
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const sessionId = url.searchParams.get("sessionId");
+  const tenantId = normalizeTenantId(url.searchParams.get("tenantId"));
   const role = url.searchParams.get("role"); // "admin" | "student"
 
   if (!sessionId) {
@@ -58,13 +137,13 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  const session = getSession(sessionId);
+  const session = getSession(tenantId, sessionId);
 
   if (role === "admin") {
     session.adminClients.add(ws);
 
     // Send all existing results immediately on connect
-    ws.send(JSON.stringify({ type: "init", results: session.results, closures: session.closures }));
+    ws.send(JSON.stringify({ type: "init", tenantId, sessionId, results: session.results, closures: session.closures }));
 
     ws.on("close", () => {
       session.adminClients.delete(ws);
@@ -77,14 +156,53 @@ wss.on("connection", (ws, req) => {
 // ─── REST API ─────────────────────────────────────────────────────────────────
 
 // POST /api/result  — student submits result
+// POST /api/teachers/:adminId -- admin publishes authorized teachers
+app.post("/api/teachers/:adminId", (req, res) => {
+  const adminId = normalizeTenantId(req.params.adminId);
+  const teachers = normalizeTeacherList(req.body?.teachers);
+
+  teacherRegistries[adminId] = {
+    adminId,
+    teachers,
+    updatedAt: new Date().toISOString()
+  };
+
+  return res.json({
+    ok: true,
+    adminId,
+    teacherCount: teachers.length,
+    updatedAt: teacherRegistries[adminId].updatedAt
+  });
+});
+
+// GET /api/teacher-access/:adminId/:token -- validates teacher access link
+app.get("/api/teacher-access/:adminId/:token", (req, res) => {
+  const adminId = normalizeTenantId(req.params.adminId);
+  const token = String(req.params.token || "").trim();
+  const registry = teacherRegistries[adminId];
+  const teacher = registry?.teachers?.find((item) => item.token === token && item.active !== false);
+
+  if (!teacher) {
+    return res.status(403).json({ ok: false, error: "Docente no autorizado o enlace vencido" });
+  }
+
+  return res.json({
+    ok: true,
+    adminId,
+    teacher: publicTeacherRecord(teacher, adminId),
+    updatedAt: registry.updatedAt
+  });
+});
+
 app.post("/api/result", (req, res) => {
   const { sessionId, entry } = req.body;
+  const tenantId = getTenantIdFromRequest(req, entry?.tenantId);
 
   if (!sessionId || !entry?.doc) {
     return res.status(400).json({ error: "sessionId y entry.doc son requeridos" });
   }
 
-  const session = getSession(sessionId);
+  const session = getSession(tenantId, sessionId);
   const normalizedDoc = normalizeDocument(entry.doc);
   const previousResult = session.results.find((r) => normalizeDocument(r.doc) === normalizedDoc);
   const previousClosure = session.closures.find((c) => normalizeDocument(c.doc) === normalizedDoc && c.date !== entry.date);
@@ -99,11 +217,11 @@ app.post("/api/result", (req, res) => {
   );
 
   if (!isDuplicate) {
-    const result = { ...entry, receivedAt: new Date().toISOString() };
+    const result = { ...entry, tenantId, sessionId, receivedAt: new Date().toISOString() };
     session.results.push(result);
 
     // Notify all admin websocket clients in real time
-    broadcast(sessionId, { type: "result", entry: result });
+    broadcast(tenantId, sessionId, { type: "result", entry: result });
   }
 
   return res.json({ ok: true, duplicate: isDuplicate });
@@ -112,12 +230,13 @@ app.post("/api/result", (req, res) => {
 // POST /api/closure  — student submits closure reason
 app.post("/api/closure", (req, res) => {
   const { sessionId, entry } = req.body;
+  const tenantId = getTenantIdFromRequest(req, entry?.tenantId);
 
   if (!sessionId || !entry?.doc) {
     return res.status(400).json({ error: "sessionId y entry.doc son requeridos" });
   }
 
-  const session = getSession(sessionId);
+  const session = getSession(tenantId, sessionId);
   const normalizedDoc = normalizeDocument(entry.doc);
   const previousClosure = session.closures.find((c) => normalizeDocument(c.doc) === normalizedDoc);
   const previousResult = session.results.find((r) => normalizeDocument(r.doc) === normalizedDoc && r.date !== entry.date);
@@ -131,9 +250,9 @@ app.post("/api/closure", (req, res) => {
   );
 
   if (!isDuplicate) {
-    const closure = { ...entry, receivedAt: new Date().toISOString() };
+    const closure = { ...entry, tenantId, sessionId, receivedAt: new Date().toISOString() };
     session.closures.push(closure);
-    broadcast(sessionId, { type: "closure", entry: closure });
+    broadcast(tenantId, sessionId, { type: "closure", entry: closure });
   }
 
   return res.json({ ok: true, duplicate: isDuplicate });
@@ -141,17 +260,21 @@ app.post("/api/closure", (req, res) => {
 
 // GET /api/results/:sessionId  — admin polls results (fallback if WS unavailable)
 app.get("/api/results/:sessionId", (req, res) => {
-  const session = sessions[req.params.sessionId];
+  const tenantId = getTenantIdFromRequest(req);
+  const session = readSession(tenantId, req.params.sessionId);
   if (!session) return res.json({ results: [], closures: [] });
-  return res.json({ results: session.results, closures: session.closures });
+  return res.json({ tenantId, sessionId: req.params.sessionId, results: session.results, closures: session.closures });
 });
 
 // GET /api/attempt-status/:sessionId/:doc  -- checks whether a student already submitted this exam
 app.get("/api/attempt-status/:sessionId/:doc", (req, res) => {
-  const session = sessions[req.params.sessionId];
+  const tenantId = getTenantIdFromRequest(req);
+  const session = readSession(tenantId, req.params.sessionId);
   const entry = findAttemptByDoc(session, req.params.doc);
   return res.json({
     ok: true,
+    tenantId,
+    sessionId: req.params.sessionId,
     blocked: Boolean(entry),
     entry: entry || null
   });
@@ -159,18 +282,21 @@ app.get("/api/attempt-status/:sessionId/:doc", (req, res) => {
 
 // DELETE /api/results/:sessionId  — admin clears results
 app.delete("/api/results/:sessionId", (req, res) => {
-  if (sessions[req.params.sessionId]) {
-    sessions[req.params.sessionId].results = [];
-    sessions[req.params.sessionId].closures = [];
-    broadcast(req.params.sessionId, { type: "cleared" });
+  const tenantId = getTenantIdFromRequest(req);
+  const session = readSession(tenantId, req.params.sessionId);
+  if (session) {
+    session.results = [];
+    session.closures = [];
+    broadcast(tenantId, req.params.sessionId, { type: "cleared" });
   }
-  return res.json({ ok: true });
+  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId });
 });
 
 // POST /api/exam/:sessionId  -- teacher publishes the active exam package
 app.post("/api/exam/:sessionId", (req, res) => {
   const sessionId = req.params.sessionId;
   const examPackage = req.body?.package || req.body?.examPackage || req.body;
+  const tenantId = getTenantIdFromRequest(req, examPackage?.tenantId);
 
   if (
     !sessionId ||
@@ -181,14 +307,15 @@ app.post("/api/exam/:sessionId", (req, res) => {
     return res.status(400).json({ error: "Paquete de examen invalido o vacio" });
   }
 
-  const session = getSession(sessionId);
+  const session = getSession(tenantId, sessionId);
   session.examPackage = {
     ...examPackage,
+    tenantId,
     sessionId,
     receivedAt: new Date().toISOString()
   };
 
-  broadcast(sessionId, {
+  broadcast(tenantId, sessionId, {
     type: "exam-updated",
     updatedAt: session.examPackage.receivedAt,
     questionCount: session.examPackage.questionBank.length
@@ -196,6 +323,7 @@ app.post("/api/exam/:sessionId", (req, res) => {
 
   return res.json({
     ok: true,
+    tenantId,
     sessionId,
     questionCount: session.examPackage.questionBank.length,
     updatedAt: session.examPackage.receivedAt
@@ -204,13 +332,14 @@ app.post("/api/exam/:sessionId", (req, res) => {
 
 // GET /api/exam/:sessionId  -- student downloads the active exam package
 app.get("/api/exam/:sessionId", (req, res) => {
-  const session = sessions[req.params.sessionId];
+  const tenantId = getTenantIdFromRequest(req);
+  const session = readSession(tenantId, req.params.sessionId);
 
   if (!session?.examPackage) {
     return res.status(404).json({ error: "No hay examen publicado para esta sesion" });
   }
 
-  return res.json({ ok: true, package: session.examPackage });
+  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId, package: session.examPackage });
 });
 
 
@@ -353,7 +482,14 @@ app.get("/api/youtube/transcript", async (req, res) => {
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "ok", app: "EVALUAPRO-UTCH Server", sessions: Object.keys(sessions).length });
+  const tenants = new Set(Object.values(sessions).map((session) => session.tenantId));
+  res.json({
+    status: "ok",
+    app: "EVALUAPRO-UTCH Server",
+    tenants: tenants.size,
+    sessions: Object.keys(sessions).length,
+    teacherRegistries: Object.keys(teacherRegistries).length
+  });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

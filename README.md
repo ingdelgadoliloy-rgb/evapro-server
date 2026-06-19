@@ -1,50 +1,58 @@
-# EVALUAPRO-UTCH — Servidor (Render)
+# EVALUAPRO-UTCH - Servidor Render
 
-Servidor WebSocket + REST para sincronización de resultados en tiempo real.
+Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docentes autorizados.
 
-## Variables de entorno (Render → Environment)
+## Variables de entorno
 
-| Variable | Requerida | Descripción |
+| Variable | Requerida | Descripcion |
 |---|---|---|
-| `PORT` | No | Puerto (Render lo asigna automáticamente) |
-| `ADMIN_SECRET` | **Sí** | Clave secreta para endpoints admin (DELETE results, POST teachers). Configura un valor aleatorio largo. |
-| `ALLOWED_ORIGINS` | **Sí** | URLs de Netlify permitidas, separadas por coma. Ej: `https://evaluapro-utch.netlify.app` |
-| `CLAUDE_API_KEY` | No | Clave Claude para fallback de YouTube transcripts |
+| `PORT` | No | Puerto del servidor. Render lo asigna automaticamente. |
+| `ADMIN_SECRET` | Si | Clave privada del administrador. Debe ser larga y aleatoria. |
+| `ALLOWED_ORIGINS` | Si | URLs de Netlify permitidas, separadas por coma. |
+| `EVAPRO_DATA_FILE` | No | Ruta del archivo JSON persistente. Ejemplo: `/tmp/evapro-store.json`. |
+| `CLAUDE_API_KEY` | No | Clave Claude para generacion IA desde backend y fallback de YouTube. |
+| `GEMINI_API_KEY` | No | Clave Gemini para generacion IA desde backend. |
 
-## Seguridad aplicada v2.1
+## Seguridad aplicada
 
-- **Rate limiting**: 30 req/min por IP para resultados; 20 para publicar examen; 10 para docentes.
-- **ADMIN_SECRET**: endpoints destructivos (DELETE, POST /teachers, POST /exam) requieren header `x-admin-secret`.
-- **CORS**: solo origenes configurados en `ALLOWED_ORIGINS`.
-- **Cabeceras HTTP**: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, X-XSS-Protection.
-- **Sanitización**: todos los payloads de entrada son validados y recortados.
-- **Límites**: máx. 500 sesiones, 300 resultados/sesión, 200 preguntas/paquete.
-- **TTL sesiones**: sesiones inactivas por más de 12h se eliminan automáticamente.
-- **Sin claves AI en servidor**: el servidor elimina geminiApiKey/claudeApiKey de los paquetes antes de almacenarlos.
+- El servidor recalcula `score`, `percent` y `grade`; no confia en la nota enviada por el navegador.
+- El paquete que descarga el estudiante no incluye `correct`, `correctAnswer`, `acceptedAnswers` ni `rationale`.
+- Publicar examenes, consultar/borrar resultados y abrir WebSocket admin requiere `ADMIN_SECRET` o token docente valido del tenant.
+- Los estudiantes solo descargan el examen seguro y envian respuestas.
+- Los examenes, docentes, resultados y cierres se guardan en `EVAPRO_DATA_FILE`.
+- El servidor elimina claves IA de los paquetes antes de almacenarlos.
+- `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render.
+- CORS queda restringido a los dominios definidos en `ALLOWED_ORIGINS`.
+- Se aplica rate limiting y limites de tamano/cantidad para reducir abuso.
 
-## Configurar en Render
+## Configuracion en Render
 
-1. Crea un **Web Service** nuevo en https://render.com
-2. Conecta este repositorio
-3. Build command: `npm install`
-4. Start command: `npm start`
-5. En **Environment**, agrega:
-   - `ADMIN_SECRET` → genera con `openssl rand -hex 32`
-   - `ALLOWED_ORIGINS` → `https://TU-SITIO.netlify.app`
-   - `CLAUDE_API_KEY` → (opcional)
+1. Crea un Web Service en Render.
+2. Conecta el repositorio del servidor.
+3. Build command: `npm install`.
+4. Start command: `npm start`.
+5. En Environment agrega:
+   - `ADMIN_SECRET`: genera una clave larga.
+   - `ALLOWED_ORIGINS`: por ejemplo `https://evaluapro-utch.netlify.app`.
+   - `EVAPRO_DATA_FILE`: por ejemplo `/tmp/evapro-store.json`.
+   - `CLAUDE_API_KEY`: opcional.
+   - `GEMINI_API_KEY`: opcional.
+
+Para persistencia institucional fuerte, usa un disco persistente de Render o una base de datos. `/tmp` puede perderse si Render recrea el servicio.
 
 ## Endpoints
 
-| Método | Ruta | Auth |
+| Metodo | Ruta | Auth |
 |---|---|---|
-| `GET` | `/` | Pública |
-| `GET` | `/api/exam/:sessionId` | Pública |
-| `POST` | `/api/exam/:sessionId` | Abierta (rate limited) |
-| `POST` | `/api/result` | Abierta (rate limited) |
-| `POST` | `/api/closure` | Abierta (rate limited) |
-| `GET` | `/api/results/:sessionId` | Pública |
-| `GET` | `/api/attempt-status/:sessionId/:doc` | Pública |
-| `DELETE` | `/api/results/:sessionId` | **ADMIN_SECRET** |
-| `POST` | `/api/teachers/:adminId` | **ADMIN_SECRET** |
-| `GET` | `/api/teacher-access/:adminId/:token` | Pública |
-| `GET` | `/api/youtube/transcript` | Pública (rate limited) |
+| `GET` | `/` | Publica |
+| `GET` | `/api/exam/:sessionId` | Publica, pero sin respuestas correctas |
+| `POST` | `/api/exam/:sessionId` | `ADMIN_SECRET` o token docente |
+| `POST` | `/api/result` | Publica; califica el servidor |
+| `POST` | `/api/closure` | Publica; califica el servidor |
+| `GET` | `/api/results/:sessionId` | `ADMIN_SECRET` o token docente |
+| `GET` | `/api/attempt-status/:sessionId/:doc` | Publica, solo estado minimo |
+| `DELETE` | `/api/results/:sessionId` | `ADMIN_SECRET` o token docente |
+| `POST` | `/api/teachers/:adminId` | `ADMIN_SECRET` |
+| `GET` | `/api/teacher-access/:adminId/:token` | Publica |
+| `POST` | `/api/ai/generate` | `ADMIN_SECRET` |
+| `GET` | `/api/youtube/transcript` | Publica con rate limit |

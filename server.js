@@ -1,8 +1,9 @@
 const express = require("express");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const WebSocket = require("ws");
 const cors = require("cors");
-const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 const server = http.createServer(app);
@@ -15,6 +16,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .filter(Boolean);
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+const DATA_FILE = process.env.EVAPRO_DATA_FILE || path.join(__dirname, "data", "evapro-store.json");
 
 // Rate limiting (simple in-memory, no external dep)
 const rateMap = new Map();
@@ -72,7 +74,7 @@ const corsOptions = {
       }
     : true,
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-tenant-id", "x-admin-secret"],
+  allowedHeaders: ["Content-Type", "Accept", "x-tenant-id", "x-admin-secret", "x-teacher-token"],
   maxAge: 86400
 };
 
@@ -100,10 +102,131 @@ function requireAdminSecret(req, res, next) {
   next();
 }
 
+function isValidAdminSecret(value) {
+  return Boolean(ADMIN_SECRET && value && String(value) === ADMIN_SECRET);
+}
+
+function isValidAdminRequest(req) {
+  return isValidAdminSecret(req.headers["x-admin-secret"] || req.query?.secret || req.body?.secret || req.query?.adminSecret);
+}
+
+function findTeacherByToken(token) {
+  const clean = String(token || "").trim();
+  if (!clean) return null;
+  for (const registry of Object.values(teacherRegistries)) {
+    const teacher = registry?.teachers?.find((item) => item.token === clean && item.active !== false);
+    if (teacher) return { ...teacher, adminId: registry.adminId };
+  }
+  return null;
+}
+
+function isValidTeacherTokenForTenant(tenantId, token) {
+  const teacher = findTeacherByToken(token);
+  return Boolean(teacher && normalizeTenantId(teacher.tenantId) === normalizeTenantId(tenantId));
+}
+
+function tenantHasRegisteredTeacher(tenantId) {
+  const normalizedTenantId = normalizeTenantId(tenantId);
+  return Object.values(teacherRegistries)
+    .some((registry) => registry?.teachers?.some((teacher) => teacher.active !== false && normalizeTenantId(teacher.tenantId) === normalizedTenantId));
+}
+
+function isValidTenantWriter(req, tenantId) {
+  if (isValidAdminRequest(req)) return true;
+  const token = String(req.headers["x-teacher-token"] || req.query?.teacherToken || req.body?.teacherToken || "").trim();
+  return isValidTeacherTokenForTenant(tenantId, token);
+}
+
+function requireTenantWriteAccess(req, res, tenantId) {
+  if (isValidTenantWriter(req, tenantId)) return true;
+  if (!ADMIN_SECRET && !tenantHasRegisteredTeacher(tenantId)) return true;
+  res.status(401).json({ error: "No autorizado para este espacio de trabajo" });
+  return false;
+}
+
 // ─── In-memory store ──────────────────────────────────────────────────────────
 const sessions = {};
 const teacherRegistries = {};
 const DEFAULT_TENANT_ID = "default";
+let persistTimer = null;
+
+loadStore();
+
+function createSessionRecord(tenantId, sessionId, seed = {}) {
+  return {
+    tenantId: normalizeTenantId(tenantId),
+    sessionId: String(sessionId || "").trim().slice(0, 128),
+    results: Array.isArray(seed.results) ? seed.results : [],
+    closures: Array.isArray(seed.closures) ? seed.closures : [],
+    examPackage: seed.examPackage || null,
+    adminClients: new Set(),
+    createdAt: Number(seed.createdAt) || Date.now(),
+    lastActivity: Number(seed.lastActivity) || Date.now()
+  };
+}
+
+function loadStore() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    Object.entries(data.sessions || {}).forEach(([key, session]) => {
+      sessions[key] = createSessionRecord(session.tenantId, session.sessionId, session);
+    });
+    Object.entries(data.teacherRegistries || {}).forEach(([key, registry]) => {
+      teacherRegistries[key] = {
+        adminId: normalizeTenantId(registry?.adminId || key),
+        teachers: normalizeTeacherList(registry?.teachers || []),
+        updatedAt: registry?.updatedAt || new Date().toISOString()
+      };
+    });
+  } catch (error) {
+    console.error("No se pudo cargar EVAPRO_DATA_FILE:", error.message);
+  }
+}
+
+function serializeStore() {
+  const serializableSessions = {};
+  Object.entries(sessions).forEach(([key, session]) => {
+    serializableSessions[key] = {
+      tenantId: session.tenantId,
+      sessionId: session.sessionId,
+      results: session.results,
+      closures: session.closures,
+      examPackage: session.examPackage,
+      createdAt: session.createdAt,
+      lastActivity: session.lastActivity
+    };
+  });
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    sessions: serializableSessions,
+    teacherRegistries
+  };
+}
+
+function schedulePersist() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(persistStore, 250);
+}
+
+function persistStore() {
+  persistTimer = null;
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    fs.writeFileSync(DATA_FILE, JSON.stringify(serializeStore(), null, 2));
+  } catch (error) {
+    console.error("No se pudo guardar EVAPRO_DATA_FILE:", error.message);
+  }
+}
+
+function persistAndExit() {
+  persistStore();
+  process.exit(0);
+}
+
+process.once("SIGTERM", persistAndExit);
+process.once("SIGINT", persistAndExit);
 
 function normalizeTenantId(value) {
   const clean = String(value || "")
@@ -144,16 +267,8 @@ function getSession(tenantId, sessionId) {
   const key = sessionKey(tenantId, sessionId);
   if (!sessions[key]) {
     pruneSessions();
-    sessions[key] = {
-      tenantId: normalizeTenantId(tenantId),
-      sessionId: String(sessionId || "").trim().slice(0, 128),
-      results: [],
-      closures: [],
-      examPackage: null,
-      adminClients: new Set(),
-      createdAt: Date.now(),
-      lastActivity: Date.now()
-    };
+    sessions[key] = createSessionRecord(tenantId, sessionId);
+    schedulePersist();
   } else {
     sessions[key].lastActivity = Date.now();
   }
@@ -194,14 +309,207 @@ function sanitizeEntry(entry) {
   return {
     doc,
     name: String(entry.name || "").trim().slice(0, 200),
-    score: typeof entry.score === "number" ? Math.min(Math.max(entry.score, 0), 9999) : 0,
-    total: typeof entry.total === "number" ? Math.min(Math.max(entry.total, 0), 9999) : 0,
-    grade: typeof entry.grade === "number" ? Number(entry.grade.toFixed(2)) : 0,
-    percent: typeof entry.percent === "number" ? Number(entry.percent.toFixed(2)) : 0,
+    score: Number(entry.score) || 0,
+    total: Number(entry.total) || 0,
+    grade: Number(entry.grade) || 0,
+    percent: Number(entry.percent) || 0,
+    answers: Array.isArray(entry.answers) ? entry.answers.slice(0, MAX_EXAM_PACKAGE_QUESTIONS) : [],
+    elapsedSeconds: Math.max(0, Math.min(Number(entry.elapsedSeconds) || 0, 24 * 60 * 60)),
     date: entry.date ? String(entry.date).slice(0, 50) : new Date().toISOString(),
     closureCode: String(entry.closureCode || "").slice(0, 20),
     closureReason: String(entry.closureReason || "").slice(0, 300),
+    closureKey: String(entry.closureKey || "").slice(0, 40),
+    closureDetail: String(entry.closureDetail || "").slice(0, 500),
     tenantId: normalizeTenantId(entry.tenantId)
+  };
+}
+
+function normalizeComparable(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9ñ\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function questionKey(value) {
+  return normalizeComparable(value).slice(0, 260);
+}
+
+function clamp(value, min, max) {
+  const number = Number.isFinite(Number(value)) ? Number(value) : min;
+  return Math.min(max, Math.max(min, number));
+}
+
+function calculateGrade(score, total) {
+  const safeTotal = Math.max(1, Number(total) || 1);
+  return Math.round((clamp(score, 0, safeTotal) / safeTotal) * 5 * 10) / 10;
+}
+
+function selectedAnswerLabel(question, selected) {
+  const type = question?.type || "multiple_choice";
+  if (type === "matching") {
+    const values = Array.isArray(selected) ? selected : [];
+    return (question.pairs || [])
+      .map((pair, index) => `${pair.left}: ${(question.matchOptions || [])[Number(values[index])] || "Sin responder"}`)
+      .join(" | ");
+  }
+  if (type === "fill_blank") {
+    return String(selected || "").trim() || "Sin responder";
+  }
+  return question?.options?.[Number(selected)] || "Sin responder";
+}
+
+function correctAnswerLabel(question) {
+  const type = question?.type || "multiple_choice";
+  if (type === "matching") {
+    return (question.pairs || []).map((pair) => `${pair.left}: ${pair.right}`).join(" | ");
+  }
+  if (type === "fill_blank") {
+    return question.acceptedAnswers?.[0] || question.correctAnswer || "";
+  }
+  return question.options?.[Number(question.correct)] || "";
+}
+
+function evaluateSubmittedAnswer(question, answer) {
+  const type = question?.type || "multiple_choice";
+  const selected = answer?.selected;
+  let isCorrect = false;
+
+  if (type === "matching") {
+    const selectedValues = Array.isArray(selected) ? selected : [];
+    const expected = (question.pairs || []).map((pair) => pair.right);
+    isCorrect = expected.length > 0 && expected.every((value, index) => {
+      const selectedLabel = (question.matchOptions || [])[Number(selectedValues[index])] || "";
+      return normalizeComparable(value) === normalizeComparable(selectedLabel);
+    });
+  } else if (type === "fill_blank") {
+    const accepted = question.acceptedAnswers || [question.correctAnswer || ""];
+    isCorrect = accepted.some((value) => normalizeComparable(value) === normalizeComparable(selected));
+  } else {
+    isCorrect = Number(selected) === Number(question.correct);
+  }
+
+  return {
+    type,
+    question: String(answer?.question || question?.question || "").slice(0, 1000),
+    selected,
+    isCorrect,
+    selectedAnswer: selectedAnswerLabel(question, selected),
+    correctAnswer: correctAnswerLabel(question),
+    rationale: String(question.rationale || question.explanation || "").slice(0, 1000),
+    explanation: String(question.explanation || question.rationale || "").slice(0, 1000),
+    hint: String(question.hint || answer?.hint || "").slice(0, 500)
+  };
+}
+
+function verifyResultEntry(session, entry) {
+  const bank = Array.isArray(session?.examPackage?.questionBank) ? session.examPackage.questionBank : [];
+  const submittedAnswers = Array.isArray(entry?.answers) ? entry.answers : [];
+  const configuredTotal = clamp(Number(session?.examPackage?.settings?.questionTotal) || bank.length || submittedAnswers.length || 1, 1, MAX_EXAM_PACKAGE_QUESTIONS);
+  const expectedTotal = bank.length ? Math.min(configuredTotal, bank.length) : configuredTotal;
+
+  if (!bank.length || !submittedAnswers.length) {
+    return {
+      ...entry,
+      score: 0,
+      total: expectedTotal,
+      percent: 0,
+      grade: 0,
+      verifiedByServer: Boolean(bank.length),
+      verificationWarning: bank.length ? "Resultado sin respuestas verificables" : "Examen no disponible para verificacion"
+    };
+  }
+
+  const byQuestion = new Map();
+  bank.forEach((question) => {
+    const key = questionKey(question?.question);
+    if (key && !byQuestion.has(key)) byQuestion.set(key, question);
+  });
+
+  const seen = new Set();
+  const verifiedAnswers = [];
+  submittedAnswers.forEach((answer) => {
+    const key = questionKey(answer?.question);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const question = byQuestion.get(key);
+    if (!question) {
+      verifiedAnswers.push({
+        type: answer?.type || "multiple_choice",
+        question: String(answer?.question || "").slice(0, 1000),
+        selected: answer?.selected,
+        isCorrect: false,
+        selectedAnswer: "Sin responder",
+        correctAnswer: "",
+        verificationWarning: "Pregunta no encontrada en el examen publicado"
+      });
+      return;
+    }
+    verifiedAnswers.push(evaluateSubmittedAnswer(question, answer));
+  });
+
+  const total = expectedTotal;
+  const score = clamp(verifiedAnswers.filter((answer) => answer.isCorrect).length, 0, total);
+  const percent = Math.round((score / Math.max(1, total)) * 100);
+  return {
+    ...entry,
+    answers: verifiedAnswers,
+    score,
+    total,
+    percent,
+    grade: calculateGrade(score, total),
+    verifiedByServer: true
+  };
+}
+
+function sanitizeQuestionForStudent(question) {
+  const type = question?.type || "multiple_choice";
+  const clean = {
+    question: question.question,
+    type,
+    difficulty: question.difficulty,
+    hint: question.hint || ""
+  };
+  if (type === "matching") {
+    clean.pairs = (question.pairs || []).map((pair) => ({ left: pair.left }));
+    clean.matchOptions = Array.isArray(question.matchOptions) ? question.matchOptions : [];
+    return clean;
+  }
+  if (type === "fill_blank") {
+    return clean;
+  }
+  clean.options = Array.isArray(question.options) ? question.options.map(sanitizeOptionForStudent).filter(Boolean) : [];
+  return clean;
+}
+
+function sanitizeOptionForStudent(option) {
+  if (option && typeof option === "object") {
+    return String(option.text || option.label || option.value || "").trim().slice(0, 500);
+  }
+  return String(option || "").trim().slice(0, 500);
+}
+
+function stripSensitiveSettings(settings = {}) {
+  return {
+    ...settings,
+    geminiApiKey: "",
+    claudeApiKey: "",
+    apiKeyGemini: "",
+    apiKeyClaude: "",
+    googleApiKey: "",
+    anthropicApiKey: "",
+    adminSecret: ""
+  };
+}
+
+function sanitizeExamPackageForStudent(examPackage) {
+  return {
+    ...examPackage,
+    settings: stripSensitiveSettings(examPackage.settings || {}),
+    questionBank: (examPackage.questionBank || []).map(sanitizeQuestionForStudent)
   };
 }
 
@@ -210,6 +518,13 @@ function findAttemptByDoc(session, doc) {
   if (!session || !normalizedDoc) return null;
   return [...session.results, ...session.closures]
     .find((entry) => normalizeDocument(entry?.doc) === normalizedDoc) || null;
+}
+
+function isAuthorizedStudent(session, entry) {
+  const allowed = Array.isArray(session?.examPackage?.allowedAccess) ? session.examPackage.allowedAccess : [];
+  if (!allowed.length) return true;
+  const doc = normalizeDocument(entry?.doc);
+  return Boolean(doc && allowed.some((student) => normalizeDocument(student?.doc) === doc));
 }
 
 function normalizeTeacherRecord(teacher) {
@@ -246,6 +561,7 @@ setInterval(() => {
     if ((sessions[key].lastActivity || 0) < cutoff) {
       sessions[key].adminClients.forEach((ws) => { try { ws.close(); } catch {} });
       delete sessions[key];
+      schedulePersist();
     }
   }
 }, 60 * 60_000);
@@ -257,12 +573,18 @@ wss.on("connection", (ws, req) => {
     const sessionId = url.searchParams.get("sessionId");
     const tenantId = normalizeTenantId(url.searchParams.get("tenantId"));
     const role = url.searchParams.get("role");
+    const secret = url.searchParams.get("secret") || url.searchParams.get("adminSecret");
+    const teacherToken = url.searchParams.get("teacherToken");
 
     if (!sessionId) { ws.close(1008, "sessionId requerido"); return; }
 
     const session = getSession(tenantId, sessionId);
 
     if (role === "admin") {
+      const allowed = isValidAdminSecret(secret) ||
+        isValidTeacherTokenForTenant(tenantId, teacherToken) ||
+        (!ADMIN_SECRET && !tenantHasRegisteredTeacher(tenantId));
+      if (!allowed) { ws.close(1008, "No autorizado"); return; }
       if (session.adminClients.size > 50) { ws.close(1008, "Too many admin clients"); return; }
       session.adminClients.add(ws);
       try {
@@ -289,6 +611,7 @@ app.post("/api/teachers/:adminId", requireAdminSecret, (req, res) => {
 
   const teachers = normalizeTeacherList(req.body?.teachers);
   teacherRegistries[adminId] = { adminId, teachers, updatedAt: new Date().toISOString() };
+  schedulePersist();
   return res.json({ ok: true, adminId, teacherCount: teachers.length, updatedAt: teacherRegistries[adminId].updatedAt });
 });
 
@@ -316,6 +639,9 @@ app.post("/api/result", (req, res) => {
   }
 
   const session = getSession(tenantId, sessionId);
+  if (!isAuthorizedStudent(session, entry)) {
+    return res.status(403).json({ error: "Estudiante no autorizado para esta sesión" });
+  }
   if (session.results.length >= MAX_RESULTS_PER_SESSION) {
     return res.status(400).json({ error: "Límite de resultados alcanzado para esta sesión" });
   }
@@ -325,16 +651,17 @@ app.post("/api/result", (req, res) => {
   const previousClosure = session.closures.find((c) => normalizeDocument(c.doc) === normalizedDoc && c.date !== entry.date);
 
   if (previousResult || previousClosure) {
-    return res.json({ ok: true, duplicate: true, blocked: true });
+    return res.json({ ok: true, duplicate: true, blocked: true, entry: previousResult || previousClosure });
   }
 
   const isDuplicate = session.results.some((r) => r.doc === entry.doc && r.date === entry.date);
   if (!isDuplicate) {
-    const result = { ...entry, tenantId, sessionId, receivedAt: new Date().toISOString() };
+    const result = verifyResultEntry(session, { ...entry, tenantId, sessionId, receivedAt: new Date().toISOString() });
     session.results.push(result);
+    schedulePersist();
     broadcast(tenantId, sessionId, { type: "result", entry: result });
   }
-  return res.json({ ok: true, duplicate: isDuplicate });
+  return res.json({ ok: true, duplicate: isDuplicate, entry: isDuplicate ? session.results.find((r) => r.doc === entry.doc && r.date === entry.date) || null : session.results[session.results.length - 1] });
 });
 
 // POST /api/closure  — student submits closure reason
@@ -351,6 +678,9 @@ app.post("/api/closure", (req, res) => {
   }
 
   const session = getSession(tenantId, sessionId);
+  if (!isAuthorizedStudent(session, entry)) {
+    return res.status(403).json({ error: "Estudiante no autorizado para esta sesión" });
+  }
   if (session.closures.length >= MAX_RESULTS_PER_SESSION) {
     return res.status(400).json({ error: "Límite de cierres alcanzado para esta sesión" });
   }
@@ -360,21 +690,23 @@ app.post("/api/closure", (req, res) => {
   const previousResult = session.results.find((r) => normalizeDocument(r.doc) === normalizedDoc && r.date !== entry.date);
 
   if (previousClosure || previousResult) {
-    return res.json({ ok: true, duplicate: true, blocked: true });
+    return res.json({ ok: true, duplicate: true, blocked: true, entry: previousClosure || previousResult });
   }
 
   const isDuplicate = session.closures.some((c) => c.doc === entry.doc && c.date === entry.date);
   if (!isDuplicate) {
-    const closure = { ...entry, tenantId, sessionId, receivedAt: new Date().toISOString() };
+    const closure = verifyResultEntry(session, { ...entry, tenantId, sessionId, receivedAt: new Date().toISOString() });
     session.closures.push(closure);
+    schedulePersist();
     broadcast(tenantId, sessionId, { type: "closure", entry: closure });
   }
-  return res.json({ ok: true, duplicate: isDuplicate });
+  return res.json({ ok: true, duplicate: isDuplicate, entry: isDuplicate ? session.closures.find((c) => c.doc === entry.doc && c.date === entry.date) || null : session.closures[session.closures.length - 1] });
 });
 
 // GET /api/results/:sessionId  — admin polls results (fallback if WS unavailable)
 app.get("/api/results/:sessionId", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
+  if (!requireTenantWriteAccess(req, res, tenantId)) return;
   const session = readSession(tenantId, req.params.sessionId);
   if (!session) return res.json({ results: [], closures: [] });
   return res.json({ tenantId, sessionId: req.params.sessionId, results: session.results, closures: session.closures });
@@ -386,16 +718,24 @@ app.get("/api/attempt-status/:sessionId/:doc", (req, res) => {
   const doc = String(req.params.doc || "").slice(0, 30);
   const session = readSession(tenantId, req.params.sessionId);
   const entry = findAttemptByDoc(session, doc);
-  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId, blocked: Boolean(entry), entry: entry || null });
+  return res.json({
+    ok: true,
+    tenantId,
+    sessionId: req.params.sessionId,
+    blocked: Boolean(entry),
+    entry: entry ? { doc: entry.doc, name: entry.name, closureCode: entry.closureCode, closureReason: entry.closureReason } : null
+  });
 });
 
 // DELETE /api/results/:sessionId  — admin clears results (requires admin secret)
-app.delete("/api/results/:sessionId", requireAdminSecret, (req, res) => {
+app.delete("/api/results/:sessionId", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
+  if (!requireTenantWriteAccess(req, res, tenantId)) return;
   const session = readSession(tenantId, req.params.sessionId);
   if (session) {
     session.results = [];
     session.closures = [];
+    schedulePersist();
     broadcast(tenantId, req.params.sessionId, { type: "cleared" });
   }
   return res.json({ ok: true, tenantId, sessionId: req.params.sessionId });
@@ -409,6 +749,7 @@ app.post("/api/exam/:sessionId", (req, res) => {
   const sessionId = String(req.params.sessionId || "").trim().slice(0, 128);
   const examPackage = req.body?.package || req.body?.examPackage || req.body;
   const tenantId = getTenantIdFromRequest(req, examPackage?.tenantId);
+  if (!requireTenantWriteAccess(req, res, tenantId)) return;
 
   if (!sessionId || !examPackage?.schema || !Array.isArray(examPackage.questionBank) || !examPackage.questionBank.length) {
     return res.status(400).json({ error: "Paquete de examen inválido o vacío" });
@@ -420,11 +761,12 @@ app.post("/api/exam/:sessionId", (req, res) => {
   // Strip AI keys before storing
   const safePackage = { ...examPackage };
   if (safePackage.settings) {
-    safePackage.settings = { ...safePackage.settings, geminiApiKey: "", claudeApiKey: "" };
+    safePackage.settings = stripSensitiveSettings(safePackage.settings);
   }
 
   const session = getSession(tenantId, sessionId);
   session.examPackage = { ...safePackage, tenantId, sessionId, receivedAt: new Date().toISOString() };
+  schedulePersist();
   broadcast(tenantId, sessionId, { type: "exam-updated", updatedAt: session.examPackage.receivedAt, questionCount: session.examPackage.questionBank.length });
   return res.json({ ok: true, tenantId, sessionId, questionCount: session.examPackage.questionBank.length, updatedAt: session.examPackage.receivedAt });
 });
@@ -434,10 +776,64 @@ app.get("/api/exam/:sessionId", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
   const session = readSession(tenantId, req.params.sessionId);
   if (!session?.examPackage) return res.status(404).json({ error: "No hay examen publicado para esta sesión" });
-  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId, package: session.examPackage });
+  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId, package: sanitizeExamPackageForStudent(session.examPackage) });
 });
 
 // ─── YouTube Transcript Proxy ─────────────────────────────────────────────────
+app.post("/api/ai/generate", requireAdminSecret, async (req, res) => {
+  if (!checkRateLimit(req, "default")) {
+    return res.status(429).json({ error: "Demasiadas solicitudes." });
+  }
+  const provider = String(req.body?.provider || "").toLowerCase();
+  const prompt = String(req.body?.prompt || "");
+  const maxTokens = clamp(Number(req.body?.maxTokens) || 8192, 1024, 32768);
+  if (!prompt || prompt.length > 900000) {
+    return res.status(400).json({ error: "Prompt vacio o demasiado grande" });
+  }
+
+  try {
+    if (provider === "claude") {
+      if (!process.env.CLAUDE_API_KEY) return res.status(400).json({ error: "CLAUDE_API_KEY no configurada en Render" });
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.CLAUDE_API_KEY,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
+          max_tokens: maxTokens,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) return res.status(response.status).json({ error: data?.error?.message || "Claude no pudo completar la generacion" });
+      return res.json({ ok: true, provider, text: data?.content?.[0]?.text || "" });
+    }
+
+    if (provider === "gemini") {
+      if (!process.env.GEMINI_API_KEY) return res.status(400).json({ error: "GEMINI_API_KEY no configurada en Render" });
+      const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: maxTokens }
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) return res.status(response.status).json({ error: data?.error?.message || "Gemini no pudo completar la generacion" });
+      return res.json({ ok: true, provider, text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "" });
+    }
+
+    return res.status(400).json({ error: "Proveedor IA no soportado" });
+  } catch (error) {
+    return res.status(502).json({ error: error.message || "Error al conectar con el proveedor IA" });
+  }
+});
+
 app.get("/api/youtube/transcript", async (req, res) => {
   if (!checkRateLimit(req, "default")) {
     return res.status(429).json({ error: "Demasiadas solicitudes." });

@@ -20,8 +20,12 @@ services:
       - key: EVAPRO_DATA_FILE
         value: /tmp/evapro-store.json
       - key: JSON_BODY_LIMIT
-        value: "30mb"
+        value: "70mb"
+      - key: MAX_AI_FILE_BYTES
+        value: "47185920"
       - key: MAX_AI_INLINE_FILE_BYTES
+        value: "47185920"
+      - key: GEMINI_INLINE_TOTAL_LIMIT
         value: "18874368"
       - key: ALLOWED_ORIGINS
         value: "https://evaluapro-utch.netlify.app,https://cartografia-examen.netlify.app"

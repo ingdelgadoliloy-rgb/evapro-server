@@ -10,8 +10,10 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 | `ADMIN_SECRET` | Si | Clave privada del administrador. Debe ser larga y aleatoria. |
 | `ALLOWED_ORIGINS` | Si | URLs de Netlify permitidas, separadas por coma. |
 | `EVAPRO_DATA_FILE` | No | Ruta del archivo JSON persistente. Ejemplo: `/tmp/evapro-store.json`. |
-| `JSON_BODY_LIMIT` | No | Limite del cuerpo JSON para IA con archivos. Por defecto `30mb`. |
-| `MAX_AI_INLINE_FILE_BYTES` | No | Tamano maximo total de PDF/imagenes enviados a Gemini. Por defecto 18 MB. |
+| `JSON_BODY_LIMIT` | No | Limite del cuerpo JSON para IA con archivos. Por defecto `70mb`. |
+| `MAX_AI_FILE_BYTES` | No | Tamano maximo total de PDF/imagenes aceptados para Gemini. Por defecto 45 MB. |
+| `MAX_AI_INLINE_FILE_BYTES` | No | Alias compatible de `MAX_AI_FILE_BYTES`. |
+| `GEMINI_INLINE_TOTAL_LIMIT` | No | Tamano maximo que se envia inline a Gemini; por encima se usa subida temporal. Por defecto 18 MB. |
 | `CLAUDE_API_KEY` | No | Clave Claude para generacion IA desde backend y fallback de YouTube. |
 | `GEMINI_API_KEY` | No | Clave Gemini para generacion IA desde backend. |
 | `CLAUDE_MODELS` | No | Lista de modelos Claude separados por coma. Por defecto usa `claude-sonnet-4-6`, `claude-sonnet-4-5-20250929`, `claude-haiku-4-5-20251001`. |
@@ -26,7 +28,7 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 - Los examenes, docentes, resultados y cierres se guardan en `EVAPRO_DATA_FILE`.
 - El servidor elimina claves IA de los paquetes antes de almacenarlos.
 - `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render con `ADMIN_SECRET` o token docente valido.
-- Gemini puede recibir PDF o imagenes compatibles desde el frontend para generar cuando el texto editable/OCR sea insuficiente.
+- Gemini puede recibir PDF o imagenes compatibles desde el frontend para generar cuando el texto editable/OCR sea insuficiente. Si superan el limite inline, el servidor usa subida temporal a Gemini.
 - CORS queda restringido a los dominios definidos en `ALLOWED_ORIGINS`.
 - Se aplica rate limiting y limites de tamano/cantidad para reducir abuso.
 
@@ -40,8 +42,9 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
    - `ADMIN_SECRET`: genera una clave larga.
    - `ALLOWED_ORIGINS`: por ejemplo `https://evaluapro-utch.netlify.app`.
    - `EVAPRO_DATA_FILE`: por ejemplo `/tmp/evapro-store.json`.
-   - `JSON_BODY_LIMIT`: por ejemplo `30mb`.
-   - `MAX_AI_INLINE_FILE_BYTES`: por ejemplo `18874368`.
+   - `JSON_BODY_LIMIT`: por ejemplo `70mb`.
+   - `MAX_AI_FILE_BYTES`: por ejemplo `47185920`.
+   - `GEMINI_INLINE_TOTAL_LIMIT`: por ejemplo `18874368`.
    - `CLAUDE_API_KEY`: opcional.
    - `GEMINI_API_KEY`: opcional.
    - `CLAUDE_MODELS` / `GEMINI_MODELS`: opcionales para cambiar el orden de modelos.

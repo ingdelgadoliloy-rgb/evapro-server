@@ -17,8 +17,10 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const DATA_FILE = process.env.EVAPRO_DATA_FILE || path.join(__dirname, "data", "evapro-store.json");
-const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "30mb";
-const MAX_AI_INLINE_FILE_BYTES = Number(process.env.MAX_AI_INLINE_FILE_BYTES || 18 * 1024 * 1024);
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "70mb";
+const LEGACY_INLINE_LIMIT = Number(process.env.MAX_AI_INLINE_FILE_BYTES || 0);
+const MAX_AI_FILE_BYTES = Number(process.env.MAX_AI_FILE_BYTES || 45 * 1024 * 1024);
+const GEMINI_INLINE_TOTAL_LIMIT = Number(process.env.GEMINI_INLINE_TOTAL_LIMIT || LEGACY_INLINE_LIMIT || 18 * 1024 * 1024);
 const CLAUDE_MODEL_FALLBACKS = (process.env.CLAUDE_MODELS || process.env.CLAUDE_MODEL || "claude-sonnet-4-6,claude-sonnet-4-5-20250929,claude-haiku-4-5-20251001")
   .split(",")
   .map((model) => model.trim())
@@ -561,17 +563,123 @@ function normalizeAiInlineFiles(files) {
       return;
     }
     const bytes = Buffer.byteLength(data.replace(/\s+/g, ""), "base64");
-    if (!bytes || bytes > MAX_AI_INLINE_FILE_BYTES || totalBytes + bytes > MAX_AI_INLINE_FILE_BYTES) {
+    if (!bytes || bytes > MAX_AI_FILE_BYTES || totalBytes + bytes > MAX_AI_FILE_BYTES) {
       return;
     }
     cleanFiles.push({
       name: String(file?.name || "fuente").replace(/[^\w.\- ()áéíóúüñÁÉÍÓÚÜÑ]/g, "").slice(0, 160),
       mimeType,
-      data: data.replace(/\s+/g, "")
+      data: data.replace(/\s+/g, ""),
+      bytes
     });
     totalBytes += bytes;
   });
   return cleanFiles;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function geminiApiUrl(pathPart, upload = false) {
+  const base = upload ? "https://generativelanguage.googleapis.com/upload/v1beta" : "https://generativelanguage.googleapis.com/v1beta";
+  return `${base}/${String(pathPart || "").replace(/^\/+/, "")}?key=${encodeURIComponent(process.env.GEMINI_API_KEY || "")}`;
+}
+
+async function uploadGeminiFile(file) {
+  const buffer = Buffer.from(file.data, "base64");
+  const startResponse = await fetch(geminiApiUrl("files", true), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Upload-Protocol": "resumable",
+      "X-Goog-Upload-Command": "start",
+      "X-Goog-Upload-Header-Content-Length": String(buffer.length),
+      "X-Goog-Upload-Header-Content-Type": file.mimeType
+    },
+    body: JSON.stringify({ file: { displayName: file.name || "fuente" } })
+  });
+  if (!startResponse.ok) {
+    const err = await startResponse.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Gemini no inicio la carga de ${file.name}`);
+  }
+  const uploadUrl = startResponse.headers.get("x-goog-upload-url");
+  if (!uploadUrl) {
+    throw new Error(`Gemini no entrego URL de carga para ${file.name}`);
+  }
+
+  const uploadResponse = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      "Content-Length": String(buffer.length),
+      "X-Goog-Upload-Offset": "0",
+      "X-Goog-Upload-Command": "upload, finalize"
+    },
+    body: buffer
+  });
+  const uploadData = await uploadResponse.json().catch(() => ({}));
+  if (!uploadResponse.ok || !uploadData?.file?.uri) {
+    throw new Error(uploadData?.error?.message || `Gemini no recibio el archivo ${file.name}`);
+  }
+  return waitForGeminiFileReady(uploadData.file);
+}
+
+async function waitForGeminiFileReady(file) {
+  let current = file;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const state = String(current?.state || "").toUpperCase();
+    if (!state || state === "ACTIVE") {
+      return current;
+    }
+    if (state === "FAILED") {
+      throw new Error(`Gemini no pudo procesar ${current.displayName || current.name || "el archivo"}`);
+    }
+    await sleep(1000);
+    const response = await fetch(geminiApiUrl(current.name || ""));
+    current = response.ok ? await response.json().catch(() => current) : current;
+  }
+  return current;
+}
+
+async function deleteGeminiFile(file) {
+  if (!file?.name) return;
+  try {
+    await fetch(geminiApiUrl(file.name), { method: "DELETE" });
+  } catch {
+    // Best-effort cleanup only.
+  }
+}
+
+async function buildGeminiRequestParts(prompt, files) {
+  const sourceFiles = Array.isArray(files) ? files : [];
+  const totalBytes = sourceFiles.reduce((sum, file) => sum + (Number(file.bytes) || 0), 0);
+  if (!sourceFiles.length || totalBytes <= GEMINI_INLINE_TOTAL_LIMIT) {
+    return {
+      uploadedFiles: [],
+      parts: [
+        { text: prompt },
+        ...sourceFiles.flatMap((file) => [
+          { text: `Fuente adjunta: ${file.name}` },
+          { inlineData: { mimeType: file.mimeType, data: file.data } }
+        ])
+      ]
+    };
+  }
+
+  const uploadedFiles = [];
+  for (const file of sourceFiles) {
+    uploadedFiles.push(await uploadGeminiFile(file));
+  }
+  return {
+    uploadedFiles,
+    parts: [
+      { text: prompt },
+      ...uploadedFiles.flatMap((file, index) => [
+        { text: `Fuente adjunta: ${sourceFiles[index]?.name || file.displayName || file.name}` },
+        { fileData: { mimeType: file.mimeType || sourceFiles[index]?.mimeType, fileUri: file.uri } }
+      ])
+    ]
+  };
 }
 
 function normalizeTeacherRecord(teacher) {
@@ -869,29 +977,27 @@ app.post("/api/ai/generate", requireAiAccess, async (req, res) => {
     if (provider === "gemini") {
       if (!process.env.GEMINI_API_KEY) return res.status(400).json({ error: "GEMINI_API_KEY no configurada en Render" });
       const inlineFiles = normalizeAiInlineFiles(req.body?.files);
-      const parts = [
-        { text: prompt },
-        ...inlineFiles.flatMap((file) => [
-          { text: `Fuente adjunta: ${file.name}` },
-          { inlineData: { mimeType: file.mimeType, data: file.data } }
-        ])
-      ];
+      const { parts, uploadedFiles } = await buildGeminiRequestParts(prompt, inlineFiles);
       let lastStatus = 502;
       let lastError = "Gemini no pudo completar la generacion";
-      for (const model of GEMINI_MODEL_FALLBACKS) {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts }],
-            generationConfig: { maxOutputTokens: maxTokens }
-          })
-        });
-        const data = await response.json().catch(() => ({}));
-        if (response.ok) return res.json({ ok: true, provider, model, text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "" });
-        lastStatus = response.status;
-        lastError = data?.error?.message || `Gemini no pudo completar la generacion con ${model}`;
-        if (![400, 404].includes(response.status)) break;
+      try {
+        for (const model of GEMINI_MODEL_FALLBACKS) {
+          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts }],
+              generationConfig: { maxOutputTokens: maxTokens }
+            })
+          });
+          const data = await response.json().catch(() => ({}));
+          if (response.ok) return res.json({ ok: true, provider, model, text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "" });
+          lastStatus = response.status;
+          lastError = data?.error?.message || `Gemini no pudo completar la generacion con ${model}`;
+          if (![400, 404].includes(response.status)) break;
+        }
+      } finally {
+        await Promise.allSettled((uploadedFiles || []).map(deleteGeminiFile));
       }
       return res.status(lastStatus).json({ error: lastError });
     }

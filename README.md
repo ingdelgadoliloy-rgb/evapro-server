@@ -10,8 +10,12 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 | `ADMIN_SECRET` | Si | Clave privada del administrador. Debe ser larga y aleatoria. |
 | `ALLOWED_ORIGINS` | Si | URLs de Netlify permitidas, separadas por coma. |
 | `EVAPRO_DATA_FILE` | No | Ruta del archivo JSON persistente. Ejemplo: `/tmp/evapro-store.json`. |
+| `JSON_BODY_LIMIT` | No | Limite del cuerpo JSON para IA con archivos. Por defecto `30mb`. |
+| `MAX_AI_INLINE_FILE_BYTES` | No | Tamano maximo total de PDF/imagenes enviados a Gemini. Por defecto 18 MB. |
 | `CLAUDE_API_KEY` | No | Clave Claude para generacion IA desde backend y fallback de YouTube. |
 | `GEMINI_API_KEY` | No | Clave Gemini para generacion IA desde backend. |
+| `CLAUDE_MODELS` | No | Lista de modelos Claude separados por coma. Por defecto usa `claude-sonnet-4-6`, `claude-sonnet-4-5-20250929`, `claude-haiku-4-5-20251001`. |
+| `GEMINI_MODELS` | No | Lista de modelos Gemini separados por coma. Por defecto usa `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.0-flash`. |
 
 ## Seguridad aplicada
 
@@ -21,7 +25,8 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 - Los estudiantes solo descargan el examen seguro y envian respuestas.
 - Los examenes, docentes, resultados y cierres se guardan en `EVAPRO_DATA_FILE`.
 - El servidor elimina claves IA de los paquetes antes de almacenarlos.
-- `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render.
+- `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render con `ADMIN_SECRET` o token docente valido.
+- Gemini puede recibir PDF o imagenes compatibles desde el frontend para generar cuando el texto editable/OCR sea insuficiente.
 - CORS queda restringido a los dominios definidos en `ALLOWED_ORIGINS`.
 - Se aplica rate limiting y limites de tamano/cantidad para reducir abuso.
 
@@ -35,8 +40,11 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
    - `ADMIN_SECRET`: genera una clave larga.
    - `ALLOWED_ORIGINS`: por ejemplo `https://evaluapro-utch.netlify.app`.
    - `EVAPRO_DATA_FILE`: por ejemplo `/tmp/evapro-store.json`.
+   - `JSON_BODY_LIMIT`: por ejemplo `30mb`.
+   - `MAX_AI_INLINE_FILE_BYTES`: por ejemplo `18874368`.
    - `CLAUDE_API_KEY`: opcional.
    - `GEMINI_API_KEY`: opcional.
+   - `CLAUDE_MODELS` / `GEMINI_MODELS`: opcionales para cambiar el orden de modelos.
 
 Para persistencia institucional fuerte, usa un disco persistente de Render o una base de datos. `/tmp` puede perderse si Render recrea el servicio.
 
@@ -54,5 +62,5 @@ Para persistencia institucional fuerte, usa un disco persistente de Render o una
 | `DELETE` | `/api/results/:sessionId` | `ADMIN_SECRET` o token docente |
 | `POST` | `/api/teachers/:adminId` | `ADMIN_SECRET` |
 | `GET` | `/api/teacher-access/:adminId/:token` | Publica |
-| `POST` | `/api/ai/generate` | `ADMIN_SECRET` |
+| `POST` | `/api/ai/generate` | `ADMIN_SECRET` o token docente |
 | `GET` | `/api/youtube/transcript` | Publica con rate limit |

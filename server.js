@@ -17,6 +17,16 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const DATA_FILE = process.env.EVAPRO_DATA_FILE || path.join(__dirname, "data", "evapro-store.json");
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "30mb";
+const MAX_AI_INLINE_FILE_BYTES = Number(process.env.MAX_AI_INLINE_FILE_BYTES || 18 * 1024 * 1024);
+const CLAUDE_MODEL_FALLBACKS = (process.env.CLAUDE_MODELS || process.env.CLAUDE_MODEL || "claude-sonnet-4-6,claude-sonnet-4-5-20250929,claude-haiku-4-5-20251001")
+  .split(",")
+  .map((model) => model.trim())
+  .filter(Boolean);
+const GEMINI_MODEL_FALLBACKS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash")
+  .split(",")
+  .map((model) => model.trim())
+  .filter(Boolean);
 
 // Rate limiting (simple in-memory, no external dep)
 const rateMap = new Map();
@@ -90,7 +100,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 // ─── Admin authentication middleware ──────────────────────────────────────────
 function requireAdminSecret(req, res, next) {
@@ -142,6 +152,19 @@ function requireTenantWriteAccess(req, res, tenantId) {
   if (!ADMIN_SECRET && !tenantHasRegisteredTeacher(tenantId)) return true;
   res.status(401).json({ error: "No autorizado para este espacio de trabajo" });
   return false;
+}
+
+function requireAiAccess(req, res, next) {
+  const tenantId = getTenantIdFromRequest(req, req.body?.tenantId);
+  if (isValidAdminRequest(req) || isValidTenantWriter(req, tenantId)) {
+    req.tenantId = tenantId;
+    return next();
+  }
+  if (!ADMIN_SECRET && !tenantHasRegisteredTeacher(tenantId)) {
+    req.tenantId = tenantId;
+    return next();
+  }
+  return res.status(401).json({ error: "No autorizado para generar con IA en este espacio de trabajo" });
 }
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
@@ -527,6 +550,30 @@ function isAuthorizedStudent(session, entry) {
   return Boolean(doc && allowed.some((student) => normalizeDocument(student?.doc) === doc));
 }
 
+function normalizeAiInlineFiles(files) {
+  const allowedMimeTypes = new Set(["application/pdf", "image/png", "image/jpeg", "image/webp", "image/bmp", "image/tiff"]);
+  const cleanFiles = [];
+  let totalBytes = 0;
+  (Array.isArray(files) ? files : []).slice(0, 5).forEach((file) => {
+    const mimeType = String(file?.mimeType || "").trim().toLowerCase();
+    const data = String(file?.data || "").trim();
+    if (!allowedMimeTypes.has(mimeType) || !/^[A-Za-z0-9+/=\s]+$/.test(data)) {
+      return;
+    }
+    const bytes = Buffer.byteLength(data.replace(/\s+/g, ""), "base64");
+    if (!bytes || bytes > MAX_AI_INLINE_FILE_BYTES || totalBytes + bytes > MAX_AI_INLINE_FILE_BYTES) {
+      return;
+    }
+    cleanFiles.push({
+      name: String(file?.name || "fuente").replace(/[^\w.\- ()áéíóúüñÁÉÍÓÚÜÑ]/g, "").slice(0, 160),
+      mimeType,
+      data: data.replace(/\s+/g, "")
+    });
+    totalBytes += bytes;
+  });
+  return cleanFiles;
+}
+
 function normalizeTeacherRecord(teacher) {
   const name = String(teacher?.name || "").trim().slice(0, 200);
   const doc = normalizeDocument(teacher?.doc);
@@ -780,7 +827,7 @@ app.get("/api/exam/:sessionId", (req, res) => {
 });
 
 // ─── YouTube Transcript Proxy ─────────────────────────────────────────────────
-app.post("/api/ai/generate", requireAdminSecret, async (req, res) => {
+app.post("/api/ai/generate", requireAiAccess, async (req, res) => {
   if (!checkRateLimit(req, "default")) {
     return res.status(429).json({ error: "Demasiadas solicitudes." });
   }
@@ -794,38 +841,59 @@ app.post("/api/ai/generate", requireAdminSecret, async (req, res) => {
   try {
     if (provider === "claude") {
       if (!process.env.CLAUDE_API_KEY) return res.status(400).json({ error: "CLAUDE_API_KEY no configurada en Render" });
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": process.env.CLAUDE_API_KEY,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
-          max_tokens: maxTokens,
-          messages: [{ role: "user", content: prompt }]
-        })
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) return res.status(response.status).json({ error: data?.error?.message || "Claude no pudo completar la generacion" });
-      return res.json({ ok: true, provider, text: data?.content?.[0]?.text || "" });
+      let lastStatus = 502;
+      let lastError = "Claude no pudo completar la generacion";
+      for (const model of CLAUDE_MODEL_FALLBACKS) {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": process.env.CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: maxTokens,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok) return res.json({ ok: true, provider, model, text: data?.content?.[0]?.text || "" });
+        lastStatus = response.status;
+        lastError = data?.error?.message || `Claude no pudo completar la generacion con ${model}`;
+        if (![400, 404].includes(response.status)) break;
+      }
+      return res.status(lastStatus).json({ error: lastError });
     }
 
     if (provider === "gemini") {
       if (!process.env.GEMINI_API_KEY) return res.status(400).json({ error: "GEMINI_API_KEY no configurada en Render" });
-      const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: maxTokens }
-        })
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) return res.status(response.status).json({ error: data?.error?.message || "Gemini no pudo completar la generacion" });
-      return res.json({ ok: true, provider, text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "" });
+      const inlineFiles = normalizeAiInlineFiles(req.body?.files);
+      const parts = [
+        { text: prompt },
+        ...inlineFiles.flatMap((file) => [
+          { text: `Fuente adjunta: ${file.name}` },
+          { inlineData: { mimeType: file.mimeType, data: file.data } }
+        ])
+      ];
+      let lastStatus = 502;
+      let lastError = "Gemini no pudo completar la generacion";
+      for (const model of GEMINI_MODEL_FALLBACKS) {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts }],
+            generationConfig: { maxOutputTokens: maxTokens }
+          })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok) return res.json({ ok: true, provider, model, text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "" });
+        lastStatus = response.status;
+        lastError = data?.error?.message || `Gemini no pudo completar la generacion con ${model}`;
+        if (![400, 404].includes(response.status)) break;
+      }
+      return res.status(lastStatus).json({ error: lastError });
     }
 
     return res.status(400).json({ error: "Proveedor IA no soportado" });

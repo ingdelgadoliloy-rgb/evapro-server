@@ -73,6 +73,15 @@ const MAX_SESSIONS = 500;
 const MAX_RESULTS_PER_SESSION = 300;
 const MAX_EXAM_PACKAGE_QUESTIONS = 200;
 const SESSION_TTL_MS = 12 * 60 * 60_000; // 12 hours
+const INPUT_LIMITS = {
+  name: 160,
+  shortText: 500,
+  question: 1200,
+  option: 700,
+  rationale: 1400,
+  prompt: 900000,
+  url: 900
+};
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const corsOptions = {
@@ -123,7 +132,7 @@ function isValidAdminRequest(req) {
 }
 
 function findTeacherByToken(token) {
-  const clean = String(token || "").trim();
+  const clean = sanitizeToken(token || "", 64);
   if (!clean) return null;
   for (const registry of Object.values(teacherRegistries)) {
     const teacher = registry?.teachers?.find((item) => item.token === clean && item.active !== false);
@@ -145,7 +154,7 @@ function tenantHasRegisteredTeacher(tenantId) {
 
 function isValidTenantWriter(req, tenantId) {
   if (isValidAdminRequest(req)) return true;
-  const token = String(req.headers["x-teacher-token"] || req.query?.teacherToken || req.body?.teacherToken || "").trim();
+  const token = sanitizeToken(req.headers["x-teacher-token"] || req.query?.teacherToken || req.body?.teacherToken || "", 64);
   return isValidTeacherTokenForTenant(tenantId, token);
 }
 
@@ -178,12 +187,17 @@ let persistTimer = null;
 loadStore();
 
 function createSessionRecord(tenantId, sessionId, seed = {}) {
+  const normalizedTenantId = normalizeTenantId(tenantId);
+  const normalizedSessionId = sanitizeSessionId(sessionId);
+  const examPackage = seed.examPackage
+    ? sanitizeExamPackageForStorage(seed.examPackage, normalizedTenantId, normalizedSessionId)
+    : null;
   return {
-    tenantId: normalizeTenantId(tenantId),
-    sessionId: String(sessionId || "").trim().slice(0, 128),
-    results: Array.isArray(seed.results) ? seed.results : [],
-    closures: Array.isArray(seed.closures) ? seed.closures : [],
-    examPackage: seed.examPackage || null,
+    tenantId: normalizedTenantId,
+    sessionId: normalizedSessionId,
+    results: (Array.isArray(seed.results) ? seed.results : []).map(sanitizeEntry).filter(Boolean).slice(0, MAX_RESULTS_PER_SESSION),
+    closures: (Array.isArray(seed.closures) ? seed.closures : []).map(sanitizeEntry).filter(Boolean).slice(0, MAX_RESULTS_PER_SESSION),
+    examPackage: examPackage?.questionBank?.length ? examPackage : null,
     adminClients: new Set(),
     createdAt: Number(seed.createdAt) || Date.now(),
     lastActivity: Number(seed.lastActivity) || Date.now()
@@ -274,7 +288,7 @@ function getTenantIdFromRequest(req, fallback = "") {
 }
 
 function sessionKey(tenantId, sessionId) {
-  return `${normalizeTenantId(tenantId)}::${String(sessionId || "").trim().slice(0, 128)}`;
+  return `${normalizeTenantId(tenantId)}::${sanitizeSessionId(sessionId)}`;
 }
 
 function pruneSessions() {
@@ -327,26 +341,151 @@ function normalizeDocument(value) {
     .replace(/\D/g, "");
 }
 
+function stripUnsafeText(value) {
+  return String(value || "")
+    .normalize("NFC")
+    .replace(/\u0000/g, "")
+    .replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/<\s*(script|style|iframe|object|embed|meta|link|base|form)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, " ")
+    .replace(/<\s*(script|style|iframe|object|embed|meta|link|base|form)[^>]*\/?\s*>/gi, " ")
+    .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, " ")
+    .replace(/\b(?:javascript|vbscript|data)\s*:/gi, "");
+}
+
+function sanitizeText(value, options = {}) {
+  const maxLength = Number(options.maxLength) || INPUT_LIMITS.shortText;
+  const multiline = Boolean(options.multiline);
+  let clean = stripUnsafeText(value);
+  clean = multiline
+    ? clean.replace(/[ \t]+\n/g, "\n").replace(/\n{4,}/g, "\n\n\n")
+    : clean.replace(/\s+/g, " ");
+  return clean.trim().slice(0, maxLength);
+}
+
+function sanitizeName(value) {
+  return sanitizeText(value, { maxLength: INPUT_LIMITS.name })
+    .replace(/[<>()[\]{}=+*/\\|~^`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sanitizeToken(value, maxLength = 128) {
+  return String(value || "").trim().replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, maxLength);
+}
+
+function sanitizeSessionId(value) {
+  return sanitizeToken(value, 128);
+}
+
+function sanitizeDifficulty(value) {
+  const clean = String(value || "").trim().toLowerCase();
+  return ["low", "medium", "high"].includes(clean) ? clean : "medium";
+}
+
+function sanitizeUrl(value) {
+  const raw = sanitizeText(value, { maxLength: INPUT_LIMITS.url });
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    url.hash = "";
+    return url.href.replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function normalizeQuestionTypesForStorage(value) {
+  const allowed = new Set(["multiple_choice", "true_false", "matching", "fill_blank"]);
+  const selected = (Array.isArray(value) ? value : [])
+    .map((type) => String(type || "").trim())
+    .filter((type) => allowed.has(type));
+  return selected.length ? [...new Set(selected)] : ["multiple_choice"];
+}
+
 function sanitizeEntry(entry) {
   if (!entry || typeof entry !== "object") return null;
   const doc = normalizeDocument(entry.doc);
   if (!doc || doc.length < 5) return null;
+  const total = clamp(Number(entry.total) || 0, 0, MAX_EXAM_PACKAGE_QUESTIONS);
+  const score = clamp(Number(entry.score) || 0, 0, Math.max(total, MAX_EXAM_PACKAGE_QUESTIONS));
   return {
     doc,
-    name: String(entry.name || "").trim().slice(0, 200),
-    score: Number(entry.score) || 0,
-    total: Number(entry.total) || 0,
-    grade: Number(entry.grade) || 0,
-    percent: Number(entry.percent) || 0,
-    answers: Array.isArray(entry.answers) ? entry.answers.slice(0, MAX_EXAM_PACKAGE_QUESTIONS) : [],
+    name: sanitizeName(entry.name),
+    score,
+    total,
+    grade: clamp(Number(entry.grade) || 0, 0, 5),
+    percent: clamp(Number(entry.percent) || 0, 0, 100),
+    answers: sanitizeSubmittedAnswers(entry.answers),
     elapsedSeconds: Math.max(0, Math.min(Number(entry.elapsedSeconds) || 0, 24 * 60 * 60)),
-    date: entry.date ? String(entry.date).slice(0, 50) : new Date().toISOString(),
-    closureCode: String(entry.closureCode || "").slice(0, 20),
-    closureReason: String(entry.closureReason || "").slice(0, 300),
-    closureKey: String(entry.closureKey || "").slice(0, 40),
-    closureDetail: String(entry.closureDetail || "").slice(0, 500),
+    date: sanitizeText(entry.date || new Date().toISOString(), { maxLength: 50 }),
+    closureCode: sanitizeText(entry.closureCode || "", { maxLength: 20 }),
+    closureReason: sanitizeText(entry.closureReason || "", { maxLength: 300 }),
+    closureKey: sanitizeText(entry.closureKey || "", { maxLength: 40 }),
+    closureDetail: sanitizeText(entry.closureDetail || "", { maxLength: 500 }),
     tenantId: normalizeTenantId(entry.tenantId)
   };
+}
+
+function sanitizeSubmittedAnswers(answers) {
+  return (Array.isArray(answers) ? answers : [])
+    .slice(0, MAX_EXAM_PACKAGE_QUESTIONS)
+    .map(sanitizeSubmittedAnswer)
+    .filter(Boolean);
+}
+
+function sanitizeSubmittedAnswer(answer) {
+  if (!answer || typeof answer !== "object") return null;
+  const type = normalizeQuestionType(answer.type);
+  const clean = {
+    type,
+    question: sanitizeText(answer.question || "", { maxLength: INPUT_LIMITS.question, multiline: true }),
+    selected: sanitizeSelectedValue(answer.selected, type),
+    isCorrect: Boolean(answer.isCorrect),
+    selectedAnswer: sanitizeText(answer.selectedAnswer || "", { maxLength: 1000, multiline: true }),
+    correctAnswer: sanitizeText(answer.correctAnswer || "", { maxLength: 1000, multiline: true }),
+    explanation: sanitizeText(answer.explanation || answer.rationale || "", { maxLength: INPUT_LIMITS.rationale, multiline: true }),
+    rationale: sanitizeText(answer.rationale || answer.explanation || "", { maxLength: INPUT_LIMITS.rationale, multiline: true }),
+    hint: sanitizeText(answer.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true })
+  };
+  if (Array.isArray(answer.options)) {
+    clean.options = answer.options.map(sanitizeOptionText).filter(Boolean).slice(0, 5);
+  }
+  if (Array.isArray(answer.pairs)) {
+    clean.pairs = answer.pairs
+      .map((pair) => ({
+        left: sanitizeText(pair?.left || "", { maxLength: 300 }),
+        right: sanitizeText(pair?.right || "", { maxLength: 500 })
+      }))
+      .filter((pair) => pair.left || pair.right)
+      .slice(0, 20);
+  }
+  if (Array.isArray(answer.matchOptions)) {
+    clean.matchOptions = answer.matchOptions.map(sanitizeOptionText).filter(Boolean).slice(0, 30);
+  }
+  if (Array.isArray(answer.acceptedAnswers)) {
+    clean.acceptedAnswers = answer.acceptedAnswers
+      .map((value) => sanitizeText(value || "", { maxLength: 220 }))
+      .filter(Boolean)
+      .slice(0, 10);
+  }
+  return clean.question ? clean : null;
+}
+
+function sanitizeSelectedValue(selected, type) {
+  if (type === "matching") {
+    return Array.isArray(selected)
+      ? selected.map((value) => {
+          const index = Number(value);
+          return Number.isInteger(index) && index >= 0 ? index : "";
+        }).slice(0, 20)
+      : [];
+  }
+  if (type === "fill_blank") {
+    return sanitizeText(selected || "", { maxLength: 220 });
+  }
+  const index = Number(selected);
+  return Number.isInteger(index) && index >= 0 ? index : null;
 }
 
 function normalizeComparable(value) {
@@ -419,14 +558,14 @@ function evaluateSubmittedAnswer(question, answer) {
 
   return {
     type,
-    question: String(answer?.question || question?.question || "").slice(0, 1000),
-    selected,
+    question: sanitizeText(answer?.question || question?.question || "", { maxLength: 1000, multiline: true }),
+    selected: sanitizeSelectedValue(selected, type),
     isCorrect,
-    selectedAnswer: selectedAnswerLabel(question, selected),
-    correctAnswer: correctAnswerLabel(question),
-    rationale: String(question.rationale || question.explanation || "").slice(0, 1000),
-    explanation: String(question.explanation || question.rationale || "").slice(0, 1000),
-    hint: String(question.hint || answer?.hint || "").slice(0, 500)
+    selectedAnswer: sanitizeText(selectedAnswerLabel(question, selected), { maxLength: 1000, multiline: true }),
+    correctAnswer: sanitizeText(correctAnswerLabel(question), { maxLength: 1000, multiline: true }),
+    rationale: sanitizeText(question.rationale || question.explanation || "", { maxLength: 1000, multiline: true }),
+    explanation: sanitizeText(question.explanation || question.rationale || "", { maxLength: 1000, multiline: true }),
+    hint: sanitizeText(question.hint || answer?.hint || "", { maxLength: 500, multiline: true })
   };
 }
 
@@ -463,9 +602,9 @@ function verifyResultEntry(session, entry) {
     const question = byQuestion.get(key);
     if (!question) {
       verifiedAnswers.push({
-        type: answer?.type || "multiple_choice",
-        question: String(answer?.question || "").slice(0, 1000),
-        selected: answer?.selected,
+        type: normalizeQuestionType(answer?.type),
+        question: sanitizeText(answer?.question || "", { maxLength: 1000, multiline: true }),
+        selected: sanitizeSelectedValue(answer?.selected, normalizeQuestionType(answer?.type)),
         isCorrect: false,
         selectedAnswer: "Sin responder",
         correctAnswer: "",
@@ -490,17 +629,132 @@ function verifyResultEntry(session, entry) {
   };
 }
 
-function sanitizeQuestionForStudent(question) {
-  const type = question?.type || "multiple_choice";
+function normalizeQuestionType(type) {
+  const clean = String(type || "").trim();
+  return ["multiple_choice", "true_false", "matching", "fill_blank"].includes(clean) ? clean : "multiple_choice";
+}
+
+function sanitizeOptionText(option) {
+  if (option && typeof option === "object") {
+    return sanitizeText(option.text || option.label || option.value || "", { maxLength: INPUT_LIMITS.option, multiline: true });
+  }
+  return sanitizeText(option || "", { maxLength: INPUT_LIMITS.option, multiline: true });
+}
+
+function sanitizeSettingsForStorage(settings = {}) {
   const clean = {
-    question: question.question,
+    readSeconds: clamp(Number(settings.readSeconds) || 50, 5, 3600),
+    answerSeconds: clamp(Number(settings.answerSeconds) || 20, 5, 3600),
+    questionTotal: clamp(Number(settings.questionTotal) || 10, 1, MAX_EXAM_PACKAGE_QUESTIONS),
+    difficulty: sanitizeDifficulty(settings.difficulty),
+    questionTypes: normalizeQuestionTypesForStorage(settings.questionTypes),
+    serverUrl: sanitizeUrl(settings.serverUrl || "")
+  };
+  return stripSensitiveSettings(clean);
+}
+
+function sanitizeAccessListForStorage(list) {
+  const seen = new Set();
+  return (Array.isArray(list) ? list : [])
+    .map((student) => ({
+      name: sanitizeName(student?.name || ""),
+      doc: normalizeDocument(student?.doc)
+    }))
+    .filter((student) => student.name && student.doc.length >= 5)
+    .filter((student) => {
+      if (seen.has(student.doc)) return false;
+      seen.add(student.doc);
+      return true;
+    })
+    .slice(0, 1000);
+}
+
+function sanitizeQuestionForStorage(question) {
+  if (!question || typeof question !== "object") return null;
+  const type = normalizeQuestionType(question.type);
+  const cleanQuestion = sanitizeText(question.question || "", { maxLength: INPUT_LIMITS.question, multiline: true });
+  if (!cleanQuestion) return null;
+
+  const rationale = sanitizeText(question.rationale || question.explanation || "", { maxLength: INPUT_LIMITS.rationale, multiline: true });
+  const base = {
+    question: cleanQuestion,
     type,
-    difficulty: question.difficulty,
-    hint: question.hint || ""
+    difficulty: sanitizeDifficulty(question.difficulty),
+    isCorrect: Boolean(question.isCorrect ?? true),
+    rationale,
+    explanation: rationale,
+    hint: sanitizeText(question.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true })
+  };
+
+  if (type === "matching") {
+    const pairs = (Array.isArray(question.pairs) ? question.pairs : [])
+      .map((pair) => ({
+        left: sanitizeText(pair?.left || "", { maxLength: 300 }),
+        right: sanitizeText(pair?.right || "", { maxLength: 500 })
+      }))
+      .filter((pair) => pair.left && pair.right)
+      .slice(0, 20);
+    if (pairs.length < 2) return null;
+    const matchOptions = [];
+    [...(Array.isArray(question.matchOptions) ? question.matchOptions : []), ...pairs.map((pair) => pair.right)]
+      .map(sanitizeOptionText)
+      .filter(Boolean)
+      .forEach((option) => {
+        const key = normalizeComparable(option);
+        if (!matchOptions.some((existing) => normalizeComparable(existing) === key)) matchOptions.push(option);
+      });
+    return { ...base, pairs, matchOptions: matchOptions.slice(0, 30) };
+  }
+
+  if (type === "fill_blank") {
+    const acceptedAnswers = (Array.isArray(question.acceptedAnswers) ? question.acceptedAnswers : [question.correctAnswer])
+      .map((answer) => sanitizeText(answer || "", { maxLength: 220 }))
+      .filter(Boolean)
+      .slice(0, 10);
+    if (!acceptedAnswers.length) return null;
+    return { ...base, correctAnswer: acceptedAnswers[0], acceptedAnswers };
+  }
+
+  const options = (Array.isArray(question.options) ? question.options : [])
+    .map(sanitizeOptionText)
+    .filter(Boolean)
+    .slice(0, 5);
+  const correct = Number(question.correct);
+  const requiredOptions = type === "true_false" ? 2 : 3;
+  if (options.length < requiredOptions || !Number.isInteger(correct) || correct < 0 || correct >= options.length) {
+    return null;
+  }
+  return { ...base, type: type === "true_false" ? "true_false" : "multiple_choice", options, correct };
+}
+
+function sanitizeExamPackageForStorage(examPackage, tenantId, sessionId) {
+  const questionBank = (Array.isArray(examPackage?.questionBank) ? examPackage.questionBank : [])
+    .slice(0, MAX_EXAM_PACKAGE_QUESTIONS)
+    .map(sanitizeQuestionForStorage)
+    .filter(Boolean);
+  return {
+    schema: sanitizeText(examPackage?.schema || "evaluapro-utch.studentlink.v3", { maxLength: 80 }),
+    settings: sanitizeSettingsForStorage(examPackage?.settings || {}),
+    allowedAccess: sanitizeAccessListForStorage(examPackage?.allowedAccess || []),
+    questionBank,
+    tenantId: normalizeTenantId(tenantId || examPackage?.tenantId),
+    sessionId: sanitizeSessionId(sessionId || examPackage?.sessionId),
+    updatedAt: sanitizeText(examPackage?.updatedAt || new Date().toISOString(), { maxLength: 50 }),
+    receivedAt: new Date().toISOString()
+  };
+}
+
+function sanitizeQuestionForStudent(question) {
+  const type = normalizeQuestionType(question?.type);
+  const clean = {
+    question: sanitizeText(question.question || "", { maxLength: INPUT_LIMITS.question, multiline: true }),
+    type,
+    difficulty: sanitizeDifficulty(question.difficulty),
+    hint: sanitizeText(question.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true })
   };
   if (type === "matching") {
-    clean.pairs = (question.pairs || []).map((pair) => ({ left: pair.left }));
-    clean.matchOptions = Array.isArray(question.matchOptions) ? question.matchOptions : [];
+    clean.pairs = (question.pairs || []).map((pair) => ({ left: sanitizeText(pair.left || "", { maxLength: 300 }) })).filter((pair) => pair.left);
+    clean.matchOptions = Array.isArray(question.matchOptions) ? question.matchOptions.map(sanitizeOptionText).filter(Boolean) : [];
     return clean;
   }
   if (type === "fill_blank") {
@@ -511,10 +765,7 @@ function sanitizeQuestionForStudent(question) {
 }
 
 function sanitizeOptionForStudent(option) {
-  if (option && typeof option === "object") {
-    return String(option.text || option.label || option.value || "").trim().slice(0, 500);
-  }
-  return String(option || "").trim().slice(0, 500);
+  return sanitizeOptionText(option).slice(0, 500);
 }
 
 function stripSensitiveSettings(settings = {}) {
@@ -533,8 +784,9 @@ function stripSensitiveSettings(settings = {}) {
 function sanitizeExamPackageForStudent(examPackage) {
   return {
     ...examPackage,
-    settings: stripSensitiveSettings(examPackage.settings || {}),
-    questionBank: (examPackage.questionBank || []).map(sanitizeQuestionForStudent)
+    settings: stripSensitiveSettings(sanitizeSettingsForStorage(examPackage.settings || {})),
+    allowedAccess: sanitizeAccessListForStorage(examPackage.allowedAccess || []),
+    questionBank: (examPackage.questionBank || []).map(sanitizeQuestionForStudent).filter((question) => question.question)
   };
 }
 
@@ -683,9 +935,9 @@ async function buildGeminiRequestParts(prompt, files) {
 }
 
 function normalizeTeacherRecord(teacher) {
-  const name = String(teacher?.name || "").trim().slice(0, 200);
+  const name = sanitizeName(teacher?.name || "");
   const doc = normalizeDocument(teacher?.doc);
-  const token = String(teacher?.token || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+  const token = sanitizeToken(teacher?.token || "", 64);
   const tenantId = normalizeTenantId(teacher?.tenantId || `doc-${doc || token}`);
   if (!name || doc.length < 5 || token.length < 10) return null;
   return { name, doc, token, tenantId, active: teacher?.active !== false };
@@ -725,11 +977,11 @@ setInterval(() => {
 wss.on("connection", (ws, req) => {
   try {
     const url = new URL(req.url, "http://localhost");
-    const sessionId = url.searchParams.get("sessionId");
+    const sessionId = sanitizeSessionId(url.searchParams.get("sessionId"));
     const tenantId = normalizeTenantId(url.searchParams.get("tenantId"));
     const role = url.searchParams.get("role");
     const secret = url.searchParams.get("secret") || url.searchParams.get("adminSecret");
-    const teacherToken = url.searchParams.get("teacherToken");
+    const teacherToken = sanitizeToken(url.searchParams.get("teacherToken"), 64);
 
     if (!sessionId) { ws.close(1008, "sessionId requerido"); return; }
 
@@ -773,7 +1025,7 @@ app.post("/api/teachers/:adminId", requireAdminSecret, (req, res) => {
 // GET /api/teacher-access/:adminId/:token  — validates teacher access
 app.get("/api/teacher-access/:adminId/:token", (req, res) => {
   const adminId = normalizeTenantId(req.params.adminId);
-  const token = String(req.params.token || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+  const token = sanitizeToken(req.params.token || "", 64);
   const registry = teacherRegistries[adminId];
   const teacher = registry?.teachers?.find((t) => t.token === token && t.active !== false);
   if (!teacher) return res.status(403).json({ ok: false, error: "Docente no autorizado o enlace vencido" });
@@ -785,7 +1037,7 @@ app.post("/api/result", (req, res) => {
   if (!checkRateLimit(req, "result")) {
     return res.status(429).json({ error: "Demasiadas solicitudes. Intenta en un minuto." });
   }
-  const { sessionId } = req.body;
+  const sessionId = sanitizeSessionId(req.body?.sessionId);
   const tenantId = getTenantIdFromRequest(req, req.body?.entry?.tenantId);
   const entry = sanitizeEntry(req.body?.entry);
 
@@ -824,7 +1076,7 @@ app.post("/api/closure", (req, res) => {
   if (!checkRateLimit(req, "closure")) {
     return res.status(429).json({ error: "Demasiadas solicitudes. Intenta en un minuto." });
   }
-  const { sessionId } = req.body;
+  const sessionId = sanitizeSessionId(req.body?.sessionId);
   const tenantId = getTenantIdFromRequest(req, req.body?.entry?.tenantId);
   const entry = sanitizeEntry(req.body?.entry);
 
@@ -862,21 +1114,23 @@ app.post("/api/closure", (req, res) => {
 app.get("/api/results/:sessionId", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
   if (!requireTenantWriteAccess(req, res, tenantId)) return;
-  const session = readSession(tenantId, req.params.sessionId);
+  const sessionId = sanitizeSessionId(req.params.sessionId);
+  const session = readSession(tenantId, sessionId);
   if (!session) return res.json({ results: [], closures: [] });
-  return res.json({ tenantId, sessionId: req.params.sessionId, results: session.results, closures: session.closures });
+  return res.json({ tenantId, sessionId, results: session.results, closures: session.closures });
 });
 
 // GET /api/attempt-status/:sessionId/:doc
 app.get("/api/attempt-status/:sessionId/:doc", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
-  const doc = String(req.params.doc || "").slice(0, 30);
-  const session = readSession(tenantId, req.params.sessionId);
+  const doc = normalizeDocument(req.params.doc);
+  const sessionId = sanitizeSessionId(req.params.sessionId);
+  const session = readSession(tenantId, sessionId);
   const entry = findAttemptByDoc(session, doc);
   return res.json({
     ok: true,
     tenantId,
-    sessionId: req.params.sessionId,
+    sessionId,
     blocked: Boolean(entry),
     entry: entry ? { doc: entry.doc, name: entry.name, closureCode: entry.closureCode, closureReason: entry.closureReason } : null
   });
@@ -886,14 +1140,15 @@ app.get("/api/attempt-status/:sessionId/:doc", (req, res) => {
 app.delete("/api/results/:sessionId", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
   if (!requireTenantWriteAccess(req, res, tenantId)) return;
-  const session = readSession(tenantId, req.params.sessionId);
+  const sessionId = sanitizeSessionId(req.params.sessionId);
+  const session = readSession(tenantId, sessionId);
   if (session) {
     session.results = [];
     session.closures = [];
     schedulePersist();
-    broadcast(tenantId, req.params.sessionId, { type: "cleared" });
+    broadcast(tenantId, sessionId, { type: "cleared" });
   }
-  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId });
+  return res.json({ ok: true, tenantId, sessionId });
 });
 
 // POST /api/exam/:sessionId  — teacher publishes the active exam package
@@ -901,7 +1156,7 @@ app.post("/api/exam/:sessionId", (req, res) => {
   if (!checkRateLimit(req, "exam_write")) {
     return res.status(429).json({ error: "Demasiadas solicitudes. Intenta en un minuto." });
   }
-  const sessionId = String(req.params.sessionId || "").trim().slice(0, 128);
+  const sessionId = sanitizeSessionId(req.params.sessionId);
   const examPackage = req.body?.package || req.body?.examPackage || req.body;
   const tenantId = getTenantIdFromRequest(req, examPackage?.tenantId);
   if (!requireTenantWriteAccess(req, res, tenantId)) return;
@@ -913,14 +1168,13 @@ app.post("/api/exam/:sessionId", (req, res) => {
     return res.status(400).json({ error: `Máximo ${MAX_EXAM_PACKAGE_QUESTIONS} preguntas por paquete` });
   }
 
-  // Strip AI keys before storing
-  const safePackage = { ...examPackage };
-  if (safePackage.settings) {
-    safePackage.settings = stripSensitiveSettings(safePackage.settings);
+  const safePackage = sanitizeExamPackageForStorage(examPackage, tenantId, sessionId);
+  if (!safePackage.questionBank.length) {
+    return res.status(400).json({ error: "El paquete no contiene preguntas validas despues de la sanitizacion" });
   }
 
   const session = getSession(tenantId, sessionId);
-  session.examPackage = { ...safePackage, tenantId, sessionId, receivedAt: new Date().toISOString() };
+  session.examPackage = safePackage;
   schedulePersist();
   broadcast(tenantId, sessionId, { type: "exam-updated", updatedAt: session.examPackage.receivedAt, questionCount: session.examPackage.questionBank.length });
   return res.json({ ok: true, tenantId, sessionId, questionCount: session.examPackage.questionBank.length, updatedAt: session.examPackage.receivedAt });
@@ -929,9 +1183,10 @@ app.post("/api/exam/:sessionId", (req, res) => {
 // GET /api/exam/:sessionId  — student downloads the active exam package
 app.get("/api/exam/:sessionId", (req, res) => {
   const tenantId = getTenantIdFromRequest(req);
-  const session = readSession(tenantId, req.params.sessionId);
+  const sessionId = sanitizeSessionId(req.params.sessionId);
+  const session = readSession(tenantId, sessionId);
   if (!session?.examPackage) return res.status(404).json({ error: "No hay examen publicado para esta sesión" });
-  return res.json({ ok: true, tenantId, sessionId: req.params.sessionId, package: sanitizeExamPackageForStudent(session.examPackage) });
+  return res.json({ ok: true, tenantId, sessionId, package: sanitizeExamPackageForStudent(session.examPackage) });
 });
 
 // ─── YouTube Transcript Proxy ─────────────────────────────────────────────────
@@ -939,8 +1194,8 @@ app.post("/api/ai/generate", requireAiAccess, async (req, res) => {
   if (!checkRateLimit(req, "default")) {
     return res.status(429).json({ error: "Demasiadas solicitudes." });
   }
-  const provider = String(req.body?.provider || "").toLowerCase();
-  const prompt = String(req.body?.prompt || "");
+  const provider = sanitizeText(req.body?.provider || "", { maxLength: 20 }).toLowerCase();
+  const prompt = sanitizeText(req.body?.prompt || "", { maxLength: INPUT_LIMITS.prompt, multiline: true });
   const maxTokens = clamp(Number(req.body?.maxTokens) || 8192, 1024, 32768);
   if (!prompt || prompt.length > 900000) {
     return res.status(400).json({ error: "Prompt vacio o demasiado grande" });

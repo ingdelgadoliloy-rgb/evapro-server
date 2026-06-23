@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const WebSocket = require("ws");
 const cors = require("cors");
+const { Pool } = require("pg");
 
 const app = express();
 const server = http.createServer(app);
@@ -17,6 +18,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const DATA_FILE = process.env.EVAPRO_DATA_FILE || path.join(__dirname, "data", "evapro-store.json");
+const DATABASE_URL = process.env.DATABASE_URL || process.env.SUPABASE_DATABASE_URL || "";
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "70mb";
 const LEGACY_INLINE_LIMIT = Number(process.env.MAX_AI_INLINE_FILE_BYTES || 0);
 const MAX_AI_FILE_BYTES = Number(process.env.MAX_AI_FILE_BYTES || 45 * 1024 * 1024);
@@ -113,6 +115,15 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
+app.use(async (_req, _res, next) => {
+  try {
+    await storeReady;
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── Admin authentication middleware ──────────────────────────────────────────
 function requireAdminSecret(req, res, next) {
   if (!ADMIN_SECRET) return next(); // not configured → open (dev mode)
@@ -183,8 +194,9 @@ const sessions = {};
 const teacherRegistries = {};
 const DEFAULT_TENANT_ID = "default";
 let persistTimer = null;
-
-loadStore();
+let dbPool = null;
+let storageMode = DATABASE_URL ? "postgres" : "json";
+const storeReady = loadStore();
 
 function createSessionRecord(tenantId, sessionId, seed = {}) {
   const normalizedTenantId = normalizeTenantId(tenantId);
@@ -204,7 +216,89 @@ function createSessionRecord(tenantId, sessionId, seed = {}) {
   };
 }
 
-function loadStore() {
+function getDatabasePool() {
+  if (!DATABASE_URL) return null;
+  if (!dbPool) {
+    dbPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: Number(process.env.DATABASE_POOL_MAX || 5),
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 15_000
+    });
+  }
+  return dbPool;
+}
+
+async function ensureDatabaseTables() {
+  const pool = getDatabasePool();
+  if (!pool) return false;
+  await pool.query(`
+    create table if not exists evapro_sessions (
+      tenant_id text not null,
+      session_id text not null,
+      results jsonb not null default '[]'::jsonb,
+      closures jsonb not null default '[]'::jsonb,
+      exam_package jsonb,
+      created_at bigint not null,
+      last_activity bigint not null,
+      primary key (tenant_id, session_id)
+    );
+  `);
+  await pool.query(`
+    create index if not exists evapro_sessions_last_activity_idx
+    on evapro_sessions (last_activity);
+  `);
+  await pool.query(`
+    create table if not exists evapro_teacher_registries (
+      admin_id text primary key,
+      teachers jsonb not null default '[]'::jsonb,
+      updated_at text not null
+    );
+  `);
+  return true;
+}
+
+async function loadPostgresStore() {
+  await ensureDatabaseTables();
+  const pool = getDatabasePool();
+  const [sessionRows, teacherRows] = await Promise.all([
+    pool.query("select tenant_id, session_id, results, closures, exam_package, created_at, last_activity from evapro_sessions"),
+    pool.query("select admin_id, teachers, updated_at from evapro_teacher_registries")
+  ]);
+  sessionRows.rows.forEach((row) => {
+    const session = createSessionRecord(row.tenant_id, row.session_id, {
+      results: Array.isArray(row.results) ? row.results : [],
+      closures: Array.isArray(row.closures) ? row.closures : [],
+      examPackage: row.exam_package || null,
+      createdAt: Number(row.created_at) || Date.now(),
+      lastActivity: Number(row.last_activity) || Date.now()
+    });
+    sessions[sessionKey(session.tenantId, session.sessionId)] = session;
+  });
+  teacherRows.rows.forEach((row) => {
+    const adminId = normalizeTenantId(row.admin_id);
+    teacherRegistries[adminId] = {
+      adminId,
+      teachers: normalizeTeacherList(row.teachers || []),
+      updatedAt: sanitizeText(row.updated_at || new Date().toISOString(), { maxLength: 50 })
+    };
+  });
+}
+
+async function loadStore() {
+  if (DATABASE_URL) {
+    try {
+      await loadPostgresStore();
+      storageMode = "postgres";
+      console.log("EVAPRO store conectado a Supabase/Postgres.");
+      return;
+    } catch (error) {
+      storageMode = "json";
+      console.error("No se pudo conectar a Supabase/Postgres. Se usara respaldo JSON:", error.message);
+    }
+  }
+
   try {
     if (!fs.existsSync(DATA_FILE)) return;
     const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -246,11 +340,61 @@ function serializeStore() {
 
 function schedulePersist() {
   if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = setTimeout(persistStore, 250);
+  persistTimer = setTimeout(() => {
+    persistStore().catch((error) => {
+      console.error("No se pudo persistir EVAPRO store:", error.message);
+    });
+  }, 250);
 }
 
-function persistStore() {
-  persistTimer = null;
+async function persistPostgresStore() {
+  await ensureDatabaseTables();
+  const pool = getDatabasePool();
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await client.query("delete from evapro_sessions");
+    await client.query("delete from evapro_teacher_registries");
+
+    for (const session of Object.values(sessions)) {
+      await client.query(
+        `insert into evapro_sessions
+          (tenant_id, session_id, results, closures, exam_package, created_at, last_activity)
+         values ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, $7)`,
+        [
+          session.tenantId,
+          session.sessionId,
+          JSON.stringify(session.results || []),
+          JSON.stringify(session.closures || []),
+          session.examPackage ? JSON.stringify(session.examPackage) : null,
+          Number(session.createdAt) || Date.now(),
+          Number(session.lastActivity) || Date.now()
+        ]
+      );
+    }
+
+    for (const registry of Object.values(teacherRegistries)) {
+      await client.query(
+        `insert into evapro_teacher_registries (admin_id, teachers, updated_at)
+         values ($1, $2::jsonb, $3)`,
+        [
+          normalizeTenantId(registry.adminId),
+          JSON.stringify(normalizeTeacherList(registry.teachers || [])),
+          sanitizeText(registry.updatedAt || new Date().toISOString(), { maxLength: 50 })
+        ]
+      );
+    }
+    await client.query("commit");
+    storageMode = "postgres";
+  } catch (error) {
+    await client.query("rollback").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function persistJsonStore() {
   try {
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
     fs.writeFileSync(DATA_FILE, JSON.stringify(serializeStore(), null, 2));
@@ -259,13 +403,36 @@ function persistStore() {
   }
 }
 
-function persistAndExit() {
-  persistStore();
-  process.exit(0);
+async function persistStore() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  if (DATABASE_URL) {
+    try {
+      await persistPostgresStore();
+      return;
+    } catch (error) {
+      storageMode = "json";
+      console.error("No se pudo guardar en Supabase/Postgres. Se usara respaldo JSON:", error.message);
+    }
+  }
+  persistJsonStore();
 }
 
-process.once("SIGTERM", persistAndExit);
-process.once("SIGINT", persistAndExit);
+async function persistAndExit() {
+  try {
+    await persistStore();
+    if (dbPool) {
+      await dbPool.end();
+    }
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.once("SIGTERM", () => { persistAndExit(); });
+process.once("SIGINT", () => { persistAndExit(); });
 
 function normalizeTenantId(value) {
   const clean = String(value || "")
@@ -974,8 +1141,9 @@ setInterval(() => {
 }, 60 * 60_000);
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   try {
+    await storeReady;
     const url = new URL(req.url, "http://localhost");
     const sessionId = sanitizeSessionId(url.searchParams.get("sessionId"));
     const tenantId = normalizeTenantId(url.searchParams.get("tenantId"));
@@ -1387,7 +1555,14 @@ app.get("/api/youtube/transcript", async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   const tenants = new Set(Object.values(sessions).map((s) => s.tenantId));
-  res.json({ status: "ok", app: "EVALUAPRO-UTCH Server", tenants: tenants.size, sessions: Object.keys(sessions).length, teacherRegistries: Object.keys(teacherRegistries).length });
+  res.json({
+    status: "ok",
+    app: "EVALUAPRO-UTCH Server",
+    storage: storageMode,
+    tenants: tenants.size,
+    sessions: Object.keys(sessions).length,
+    teacherRegistries: Object.keys(teacherRegistries).length
+  });
 });
 
 // ─── Global error handler ─────────────────────────────────────────────────────

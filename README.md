@@ -9,6 +9,9 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 | `PORT` | No | Puerto del servidor. Render lo asigna automaticamente. |
 | `ADMIN_SECRET` | Si | Clave privada del administrador. Debe ser larga y aleatoria. |
 | `ALLOWED_ORIGINS` | Si | URLs de Netlify permitidas, separadas por coma. |
+| `DATABASE_URL` | Recomendado | Cadena de conexion PostgreSQL de Supabase. Si existe, el servidor guarda sesiones, examenes, resultados y docentes en Supabase. |
+| `SUPABASE_DATABASE_URL` | No | Alias de `DATABASE_URL`, por si prefieres nombrarla explicitamente. |
+| `DATABASE_POOL_MAX` | No | Maximo de conexiones PostgreSQL. Por defecto `5`. |
 | `EVAPRO_DATA_FILE` | No | Ruta del archivo JSON persistente. Ejemplo: `/tmp/evapro-store.json`. |
 | `JSON_BODY_LIMIT` | No | Limite del cuerpo JSON para IA con archivos. Por defecto `70mb`. |
 | `MAX_AI_FILE_BYTES` | No | Tamano maximo total de PDF/imagenes aceptados para Gemini. Por defecto 45 MB. |
@@ -25,7 +28,7 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 - El paquete que descarga el estudiante no incluye `correct`, `correctAnswer`, `acceptedAnswers` ni `rationale`.
 - Publicar examenes, consultar/borrar resultados y abrir WebSocket admin requiere `ADMIN_SECRET` o token docente valido del tenant.
 - Los estudiantes solo descargan el examen seguro y envian respuestas.
-- Los examenes, docentes, resultados y cierres se guardan en `EVAPRO_DATA_FILE`.
+- Los examenes, docentes, resultados y cierres se guardan en Supabase/Postgres si `DATABASE_URL` esta configurada. Si no, se usa `EVAPRO_DATA_FILE` como respaldo JSON.
 - El servidor elimina claves IA de los paquetes antes de almacenarlos.
 - `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render con `ADMIN_SECRET` o token docente valido.
 - Gemini puede recibir PDF o imagenes compatibles desde el frontend para generar cuando el texto editable/OCR sea insuficiente. Si superan el limite inline, el servidor usa subida temporal a Gemini.
@@ -41,6 +44,7 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 5. En Environment agrega:
    - `ADMIN_SECRET`: genera una clave larga.
    - `ALLOWED_ORIGINS`: por ejemplo `https://evaluapro-utch.netlify.app`.
+   - `DATABASE_URL`: cadena de conexion PostgreSQL de Supabase. Recomendado: usar la conexion pooler/transaction de Supabase para servicios web.
    - `EVAPRO_DATA_FILE`: por ejemplo `/tmp/evapro-store.json`.
    - `JSON_BODY_LIMIT`: por ejemplo `70mb`.
    - `MAX_AI_FILE_BYTES`: por ejemplo `47185920`.
@@ -49,7 +53,24 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
    - `GEMINI_API_KEY`: opcional.
    - `CLAUDE_MODELS` / `GEMINI_MODELS`: opcionales para cambiar el orden de modelos.
 
-Para persistencia institucional fuerte, usa un disco persistente de Render o una base de datos. `/tmp` puede perderse si Render recrea el servicio.
+Para persistencia institucional fuerte, usa `DATABASE_URL` con Supabase. `/tmp` puede perderse si Render recrea el servicio.
+
+## Configuracion con Supabase
+
+1. Crea un proyecto en Supabase.
+2. En el dashboard del proyecto, abre `Connect` o `Project Settings > Database`.
+3. Copia la cadena de conexion PostgreSQL tipo pooler/transaction.
+4. En Render, agrega esa cadena como `DATABASE_URL`.
+5. Despliega nuevamente el servidor.
+
+El servidor crea automaticamente estas tablas si no existen:
+
+- `evapro_sessions`: sesiones, paquetes de examen, resultados y cierres.
+- `evapro_teacher_registries`: listados de docentes autorizados por administrador.
+
+Tambien puedes ver o ejecutar manualmente la estructura en `supabase-schema.sql`.
+
+El endpoint `/` muestra `storage: "postgres"` cuando Supabase esta activo. Si muestra `storage: "json"`, Render no pudo conectarse a Supabase y esta usando el respaldo local.
 
 ## Endpoints
 

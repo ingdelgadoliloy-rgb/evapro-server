@@ -8,7 +8,8 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 |---|---|---|
 | `PORT` | No | Puerto del servidor. Render lo asigna automaticamente. |
 | `ADMIN_SECRET` | Si | Clave privada del administrador. Debe ser larga y aleatoria. |
-| `ALLOWED_ORIGINS` | Si | URLs de Netlify permitidas, separadas por coma. |
+| `ALLOWED_ORIGINS` | No | URLs adicionales permitidas, separadas por coma. `https://evaluapro-utch.netlify.app` ya viene permitido por defecto. |
+| `ALLOW_FILE_ORIGIN` | No | Permite pruebas desde `file:///` cuando no sea `"false"`. Por defecto esta permitido para facilitar pruebas locales. |
 | `DATABASE_URL` | Recomendado | Cadena de conexion PostgreSQL de Supabase. Si existe, el servidor guarda sesiones, examenes, resultados y docentes en Supabase. |
 | `SUPABASE_DATABASE_URL` | No | Alias de `DATABASE_URL`, por si prefieres nombrarla explicitamente. |
 | `DATABASE_POOL_MAX` | No | Maximo de conexiones PostgreSQL. Por defecto `5`. |
@@ -32,7 +33,7 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 - El servidor elimina claves IA de los paquetes antes de almacenarlos.
 - `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render con `ADMIN_SECRET` o token docente valido.
 - Gemini puede recibir PDF o imagenes compatibles desde el frontend para generar cuando el texto editable/OCR sea insuficiente. Si superan el limite inline, el servidor usa subida temporal a Gemini.
-- CORS queda restringido a los dominios definidos en `ALLOWED_ORIGINS`.
+- CORS permite por defecto `https://evaluapro-utch.netlify.app` y los dominios extra definidos en `ALLOWED_ORIGINS`.
 - Se aplica rate limiting y limites de tamano/cantidad para reducir abuso.
 
 ## Configuracion en Render
@@ -43,7 +44,7 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 4. Start command: `npm start`.
 5. En Environment agrega:
    - `ADMIN_SECRET`: genera una clave larga.
-   - `ALLOWED_ORIGINS`: por ejemplo `https://evaluapro-utch.netlify.app`.
+   - `ALLOWED_ORIGINS`: opcional para dominios extra. El dominio `https://evaluapro-utch.netlify.app` ya queda permitido por defecto.
    - `DATABASE_URL`: cadena de conexion PostgreSQL de Supabase. Recomendado: usar la conexion pooler/transaction de Supabase para servicios web.
    - `EVAPRO_DATA_FILE`: por ejemplo `/tmp/evapro-store.json`.
    - `JSON_BODY_LIMIT`: por ejemplo `70mb`.

@@ -11,10 +11,23 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ─── Security & Configuration ─────────────────────────────────────────────────
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://evaluapro-utch.netlify.app",
+  "http://localhost:4327",
+  "http://localhost:4331",
+  "http://localhost:4333",
+  "http://127.0.0.1:4327",
+  "http://127.0.0.1:4331",
+  "http://127.0.0.1:4333"
+];
+const ALLOW_FILE_ORIGIN = process.env.ALLOW_FILE_ORIGIN !== "false";
+const ALLOWED_ORIGINS = [
+  ...DEFAULT_ALLOWED_ORIGINS,
+  ...(process.env.ALLOWED_ORIGINS || "").split(",")
+]
+  .map(normalizeCorsOrigin)
+  .filter(Boolean)
+  .filter((origin, index, list) => list.indexOf(origin) === index);
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const DATA_FILE = process.env.EVAPRO_DATA_FILE || path.join(__dirname, "data", "evapro-store.json");
@@ -86,16 +99,33 @@ const INPUT_LIMITS = {
 };
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
+function normalizeCorsOrigin(origin) {
+  const clean = String(origin || "").trim().replace(/\/$/, "");
+  if (!clean) return "";
+  if (clean === "*" || clean === "null") return clean;
+  try {
+    return new URL(clean).origin;
+  } catch {
+    return clean;
+  }
+}
+
+function isAllowedCorsOrigin(origin) {
+  const clean = normalizeCorsOrigin(origin);
+  if (!clean) return true;
+  if (ALLOW_FILE_ORIGIN && clean === "null") return true;
+  if (ALLOWED_ORIGINS.includes("*")) return true;
+  return ALLOWED_ORIGINS.includes(clean);
+}
+
 const corsOptions = {
-  origin: ALLOWED_ORIGINS.length
-    ? (origin, cb) => {
-        if (!origin || ALLOWED_ORIGINS.some((o) => origin === o || origin.endsWith(o))) {
-          cb(null, true);
-        } else {
-          cb(new Error("CORS: origin not allowed"));
-        }
-      }
-    : true,
+  origin: (origin, cb) => {
+    if (isAllowedCorsOrigin(origin)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`CORS: origin not allowed (${origin || "empty"})`));
+    }
+  },
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Accept", "x-tenant-id", "x-admin-secret", "x-teacher-token"],
   maxAge: 86400

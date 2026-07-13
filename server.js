@@ -97,6 +97,7 @@ const INPUT_LIMITS = {
   prompt: 900000,
   url: 900
 };
+const ACADEMIC_MODES = ["institutional", "preicfes", "presaberpro"];
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 function normalizeCorsOrigin(origin) {
@@ -182,9 +183,18 @@ function findTeacherByToken(token) {
   return null;
 }
 
-function isValidTeacherTokenForTenant(tenantId, token) {
+function teacherCanUseAcademicMode(teacher, academicMode) {
+  if (!academicMode) return true;
+  return normalizeAcademicModes(teacher?.academicModes).includes(sanitizeAcademicMode(academicMode));
+}
+
+function isValidTeacherTokenForTenant(tenantId, token, academicMode = "") {
   const teacher = findTeacherByToken(token);
-  return Boolean(teacher && normalizeTenantId(teacher.tenantId) === normalizeTenantId(tenantId));
+  return Boolean(
+    teacher &&
+    normalizeTenantId(teacher.tenantId) === normalizeTenantId(tenantId) &&
+    teacherCanUseAcademicMode(teacher, academicMode)
+  );
 }
 
 function tenantHasRegisteredTeacher(tenantId) {
@@ -193,14 +203,14 @@ function tenantHasRegisteredTeacher(tenantId) {
     .some((registry) => registry?.teachers?.some((teacher) => teacher.active !== false && normalizeTenantId(teacher.tenantId) === normalizedTenantId));
 }
 
-function isValidTenantWriter(req, tenantId) {
+function isValidTenantWriter(req, tenantId, academicMode = "") {
   if (isValidAdminRequest(req)) return true;
   const token = sanitizeToken(req.headers["x-teacher-token"] || req.query?.teacherToken || req.body?.teacherToken || "", 64);
-  return isValidTeacherTokenForTenant(tenantId, token);
+  return isValidTeacherTokenForTenant(tenantId, token, academicMode);
 }
 
-function requireTenantWriteAccess(req, res, tenantId) {
-  if (isValidTenantWriter(req, tenantId)) return true;
+function requireTenantWriteAccess(req, res, tenantId, academicMode = "") {
+  if (isValidTenantWriter(req, tenantId, academicMode)) return true;
   if (!ADMIN_SECRET && !tenantHasRegisteredTeacher(tenantId)) return true;
   res.status(401).json({ error: "No autorizado para este espacio de trabajo" });
   return false;
@@ -208,8 +218,10 @@ function requireTenantWriteAccess(req, res, tenantId) {
 
 function requireAiAccess(req, res, next) {
   const tenantId = getTenantIdFromRequest(req, req.body?.tenantId);
-  if (isValidAdminRequest(req) || isValidTenantWriter(req, tenantId)) {
+  const academicMode = sanitizeAcademicMode(req.body?.academicMode || req.query?.academicMode || "");
+  if (isValidAdminRequest(req) || isValidTenantWriter(req, tenantId, academicMode)) {
     req.tenantId = tenantId;
+    req.academicMode = academicMode;
     return next();
   }
   if (!ADMIN_SECRET && !tenantHasRegisteredTeacher(tenantId)) {
@@ -579,6 +591,40 @@ function sanitizeDifficulty(value) {
   return ["low", "medium", "high"].includes(clean) ? clean : "medium";
 }
 
+function sanitizeAcademicMode(value) {
+  const clean = String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "");
+  const aliases = {
+    examen: "institutional",
+    institucional: "institutional",
+    institution: "institutional",
+    institutional: "institutional",
+    saber11: "preicfes",
+    saber_11: "preicfes",
+    "saber-11": "preicfes",
+    icfes: "preicfes",
+    preicfes: "preicfes",
+    pre_icfes: "preicfes",
+    "pre-icfes": "preicfes",
+    saberpro: "presaberpro",
+    saber_pro: "presaberpro",
+    "saber-pro": "presaberpro",
+    presaberpro: "presaberpro",
+    pre_saber_pro: "presaberpro",
+    "pre-saber-pro": "presaberpro"
+  };
+  return aliases[clean] || (ACADEMIC_MODES.includes(clean) ? clean : "institutional");
+}
+
+function normalizeAcademicModes(value) {
+  const raw = Array.isArray(value)
+    ? value
+    : String(value || "").split(/[,\s;/|]+/).filter(Boolean);
+  const modes = raw
+    .map(sanitizeAcademicMode)
+    .filter((mode, index, list) => ACADEMIC_MODES.includes(mode) && list.indexOf(mode) === index);
+  return modes.length ? modes : [...ACADEMIC_MODES];
+}
+
 function sanitizeUrl(value) {
   const raw = sanitizeText(value, { maxLength: INPUT_LIMITS.url });
   if (!raw) return "";
@@ -620,6 +666,7 @@ function sanitizeEntry(entry) {
     closureReason: sanitizeText(entry.closureReason || "", { maxLength: 300 }),
     closureKey: sanitizeText(entry.closureKey || "", { maxLength: 40 }),
     closureDetail: sanitizeText(entry.closureDetail || "", { maxLength: 500 }),
+    academicMode: sanitizeAcademicMode(entry.academicMode || ""),
     tenantId: normalizeTenantId(entry.tenantId)
   };
 }
@@ -779,6 +826,7 @@ function verifyResultEntry(session, entry) {
       total: expectedTotal,
       percent: 0,
       grade: 0,
+      academicMode: sanitizeAcademicMode(entry.academicMode || session?.examPackage?.academicMode || session?.examPackage?.settings?.academicMode),
       verifiedByServer: Boolean(bank.length),
       verificationWarning: bank.length ? "Resultado sin respuestas verificables" : "Examen no disponible para verificacion"
     };
@@ -822,6 +870,7 @@ function verifyResultEntry(session, entry) {
     total,
     percent,
     grade: calculateGrade(score, total),
+    academicMode: sanitizeAcademicMode(entry.academicMode || session?.examPackage?.academicMode || session?.examPackage?.settings?.academicMode),
     verifiedByServer: true
   };
 }
@@ -844,6 +893,7 @@ function sanitizeSettingsForStorage(settings = {}) {
     answerSeconds: clamp(Number(settings.answerSeconds) || 20, 5, 3600),
     questionTotal: clamp(Number(settings.questionTotal) || 10, 1, MAX_EXAM_PACKAGE_QUESTIONS),
     difficulty: sanitizeDifficulty(settings.difficulty),
+    academicMode: sanitizeAcademicMode(settings.academicMode || ""),
     questionTypes: normalizeQuestionTypesForStorage(settings.questionTypes),
     serverUrl: sanitizeUrl(settings.serverUrl || "")
   };
@@ -931,10 +981,14 @@ function sanitizeExamPackageForStorage(examPackage, tenantId, sessionId) {
     .filter(Boolean);
   return {
     schema: sanitizeText(examPackage?.schema || "evaluapro-utch.studentlink.v3", { maxLength: 80 }),
-    settings: sanitizeSettingsForStorage(examPackage?.settings || {}),
+    settings: sanitizeSettingsForStorage({
+      ...(examPackage?.settings || {}),
+      academicMode: examPackage?.academicMode || examPackage?.settings?.academicMode
+    }),
     allowedAccess: sanitizeAccessListForStorage(examPackage?.allowedAccess || []),
     questionBank,
     tenantId: normalizeTenantId(tenantId || examPackage?.tenantId),
+    academicMode: sanitizeAcademicMode(examPackage?.academicMode || examPackage?.settings?.academicMode || ""),
     sessionId: sanitizeSessionId(sessionId || examPackage?.sessionId),
     updatedAt: sanitizeText(examPackage?.updatedAt || new Date().toISOString(), { maxLength: 50 }),
     receivedAt: new Date().toISOString()
@@ -1137,7 +1191,7 @@ function normalizeTeacherRecord(teacher) {
   const token = sanitizeToken(teacher?.token || "", 64);
   const tenantId = normalizeTenantId(teacher?.tenantId || `doc-${doc || token}`);
   if (!name || doc.length < 5 || token.length < 10) return null;
-  return { name, doc, token, tenantId, active: teacher?.active !== false };
+  return { name, doc, token, tenantId, academicModes: normalizeAcademicModes(teacher?.academicModes), active: teacher?.active !== false };
 }
 
 function normalizeTeacherList(value) {
@@ -1155,7 +1209,7 @@ function normalizeTeacherList(value) {
 }
 
 function publicTeacherRecord(teacher, adminId) {
-  return { name: teacher.name, doc: teacher.doc, tenantId: teacher.tenantId, adminId, active: teacher.active };
+  return { name: teacher.name, doc: teacher.doc, tenantId: teacher.tenantId, academicModes: normalizeAcademicModes(teacher.academicModes), adminId, active: teacher.active };
 }
 
 // Cleanup stale sessions every hour
@@ -1357,7 +1411,8 @@ app.post("/api/exam/:sessionId", (req, res) => {
   const sessionId = sanitizeSessionId(req.params.sessionId);
   const examPackage = req.body?.package || req.body?.examPackage || req.body;
   const tenantId = getTenantIdFromRequest(req, examPackage?.tenantId);
-  if (!requireTenantWriteAccess(req, res, tenantId)) return;
+  const academicMode = sanitizeAcademicMode(examPackage?.academicMode || examPackage?.settings?.academicMode || req.body?.academicMode || "");
+  if (!requireTenantWriteAccess(req, res, tenantId, academicMode)) return;
 
   if (!sessionId || !examPackage?.schema || !Array.isArray(examPackage.questionBank) || !examPackage.questionBank.length) {
     return res.status(400).json({ error: "Paquete de examen inválido o vacío" });

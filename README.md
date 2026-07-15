@@ -36,6 +36,13 @@ Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docen
 - CORS permite por defecto `https://evaluapro-utch.netlify.app` y los dominios extra definidos en `ALLOWED_ORIGINS`.
 - Se aplica rate limiting y limites de tamano/cantidad para reducir abuso.
 
+## Simuladores PreICFES y Pre Saber Pro
+
+- El paquete de examen conserva el modo academico y la configuracion del simulacro: pruebas o modulos, estrategia de distribucion y modulo especifico opcional.
+- Las preguntas pueden incluir metadatos de area, competencia y modulo para el reporte docente.
+- Comunicacion Escrita de Pre Saber Pro usa respuesta abierta con rubrica. La respuesta se conserva para revision docente y no modifica la calificacion automatica hasta que exista un proceso de revision.
+- Los simulacros son ejercicios originales de practica. No reemplazan ni reproducen materiales oficiales del ICFES.
+
 ## Configuracion en Render
 
 1. Crea un Web Service en Render.

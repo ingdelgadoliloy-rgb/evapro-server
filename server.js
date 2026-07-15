@@ -639,7 +639,7 @@ function sanitizeUrl(value) {
 }
 
 function normalizeQuestionTypesForStorage(value) {
-  const allowed = new Set(["multiple_choice", "true_false", "matching", "fill_blank"]);
+  const allowed = new Set(["multiple_choice", "true_false", "matching", "fill_blank", "open_response"]);
   const selected = (Array.isArray(value) ? value : [])
     .map((type) => String(type || "").trim())
     .filter((type) => allowed.has(type));
@@ -657,6 +657,8 @@ function sanitizeEntry(entry) {
     name: sanitizeName(entry.name),
     score,
     total,
+    exerciseTotal: clamp(Number(entry.exerciseTotal) || total, 0, MAX_EXAM_PACKAGE_QUESTIONS),
+    pendingReview: clamp(Number(entry.pendingReview) || 0, 0, MAX_EXAM_PACKAGE_QUESTIONS),
     grade: clamp(Number(entry.grade) || 0, 0, 5),
     percent: clamp(Number(entry.percent) || 0, 0, 100),
     answers: sanitizeSubmittedAnswers(entry.answers),
@@ -692,6 +694,10 @@ function sanitizeSubmittedAnswer(answer) {
     rationale: sanitizeText(answer.rationale || answer.explanation || "", { maxLength: INPUT_LIMITS.rationale, multiline: true }),
     hint: sanitizeText(answer.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true })
   };
+  clean.pendingReview = Boolean(answer.pendingReview);
+  clean.area = sanitizeText(answer.area || "", { maxLength: 120 });
+  clean.competency = sanitizeText(answer.competency || "", { maxLength: 240 });
+  clean.module = sanitizeText(answer.module || "", { maxLength: 160 });
   if (Array.isArray(answer.options)) {
     clean.options = answer.options.map(sanitizeOptionText).filter(Boolean).slice(0, 5);
   }
@@ -727,6 +733,9 @@ function sanitizeSelectedValue(selected, type) {
   }
   if (type === "fill_blank") {
     return sanitizeText(selected || "", { maxLength: 220 });
+  }
+  if (type === "open_response") {
+    return sanitizeText(selected || "", { maxLength: 2400, multiline: true });
   }
   const index = Number(selected);
   return Number.isInteger(index) && index >= 0 ? index : null;
@@ -767,6 +776,9 @@ function selectedAnswerLabel(question, selected) {
   if (type === "fill_blank") {
     return String(selected || "").trim() || "Sin responder";
   }
+  if (type === "open_response") {
+    return String(selected || "").trim() || "Sin responder";
+  }
   return question?.options?.[Number(selected)] || "Sin responder";
 }
 
@@ -777,6 +789,9 @@ function correctAnswerLabel(question) {
   }
   if (type === "fill_blank") {
     return question.acceptedAnswers?.[0] || question.correctAnswer || "";
+  }
+  if (type === "open_response") {
+    return "Respuesta abierta pendiente de revision docente";
   }
   return question.options?.[Number(question.correct)] || "";
 }
@@ -796,6 +811,23 @@ function evaluateSubmittedAnswer(question, answer) {
   } else if (type === "fill_blank") {
     const accepted = question.acceptedAnswers || [question.correctAnswer || ""];
     isCorrect = accepted.some((value) => normalizeComparable(value) === normalizeComparable(selected));
+  } else if (type === "open_response") {
+    return {
+      type,
+      question: sanitizeText(answer?.question || question?.question || "", { maxLength: 1000, multiline: true }),
+      selected: sanitizeSelectedValue(selected, type),
+      isCorrect: false,
+      pendingReview: true,
+      selectedAnswer: sanitizeText(selectedAnswerLabel(question, selected), { maxLength: 2400, multiline: true }),
+      correctAnswer: "Respuesta abierta pendiente de revision docente",
+      rationale: sanitizeText(question.rationale || question.explanation || "", { maxLength: 1000, multiline: true }),
+      explanation: sanitizeText(question.explanation || question.rationale || "", { maxLength: 1000, multiline: true }),
+      hint: sanitizeText(question.hint || answer?.hint || "", { maxLength: 500, multiline: true }),
+      area: sanitizeText(question.area || answer?.area || "", { maxLength: 120 }),
+      competency: sanitizeText(question.competency || answer?.competency || "", { maxLength: 240 }),
+      module: sanitizeText(question.module || answer?.module || "", { maxLength: 160 }),
+      rubric: (Array.isArray(question.rubric) ? question.rubric : []).map((item) => sanitizeText(item || "", { maxLength: 300 })).filter(Boolean).slice(0, 6)
+    };
   } else {
     isCorrect = Number(selected) === Number(question.correct);
   }
@@ -809,7 +841,10 @@ function evaluateSubmittedAnswer(question, answer) {
     correctAnswer: sanitizeText(correctAnswerLabel(question), { maxLength: 1000, multiline: true }),
     rationale: sanitizeText(question.rationale || question.explanation || "", { maxLength: 1000, multiline: true }),
     explanation: sanitizeText(question.explanation || question.rationale || "", { maxLength: 1000, multiline: true }),
-    hint: sanitizeText(question.hint || answer?.hint || "", { maxLength: 500, multiline: true })
+    hint: sanitizeText(question.hint || answer?.hint || "", { maxLength: 500, multiline: true }),
+    area: sanitizeText(question.area || answer?.area || "", { maxLength: 120 }),
+    competency: sanitizeText(question.competency || answer?.competency || "", { maxLength: 240 }),
+    module: sanitizeText(question.module || answer?.module || "", { maxLength: 160 })
   };
 }
 
@@ -824,6 +859,8 @@ function verifyResultEntry(session, entry) {
       ...entry,
       score: 0,
       total: expectedTotal,
+      exerciseTotal: expectedTotal,
+      pendingReview: 0,
       percent: 0,
       grade: 0,
       academicMode: sanitizeAcademicMode(entry.academicMode || session?.examPackage?.academicMode || session?.examPackage?.settings?.academicMode),
@@ -860,7 +897,9 @@ function verifyResultEntry(session, entry) {
     verifiedAnswers.push(evaluateSubmittedAnswer(question, answer));
   });
 
-  const total = expectedTotal;
+  const exerciseTotal = expectedTotal;
+  const pendingReview = verifiedAnswers.filter((answer) => answer.pendingReview || answer.type === "open_response").length;
+  const total = Math.max(1, exerciseTotal - pendingReview);
   const score = clamp(verifiedAnswers.filter((answer) => answer.isCorrect).length, 0, total);
   const percent = Math.round((score / Math.max(1, total)) * 100);
   return {
@@ -868,6 +907,8 @@ function verifyResultEntry(session, entry) {
     answers: verifiedAnswers,
     score,
     total,
+    exerciseTotal,
+    pendingReview,
     percent,
     grade: calculateGrade(score, total),
     academicMode: sanitizeAcademicMode(entry.academicMode || session?.examPackage?.academicMode || session?.examPackage?.settings?.academicMode),
@@ -877,7 +918,7 @@ function verifyResultEntry(session, entry) {
 
 function normalizeQuestionType(type) {
   const clean = String(type || "").trim();
-  return ["multiple_choice", "true_false", "matching", "fill_blank"].includes(clean) ? clean : "multiple_choice";
+  return ["multiple_choice", "true_false", "matching", "fill_blank", "open_response"].includes(clean) ? clean : "multiple_choice";
 }
 
 function sanitizeOptionText(option) {
@@ -894,10 +935,25 @@ function sanitizeSettingsForStorage(settings = {}) {
     questionTotal: clamp(Number(settings.questionTotal) || 10, 1, MAX_EXAM_PACKAGE_QUESTIONS),
     difficulty: sanitizeDifficulty(settings.difficulty),
     academicMode: sanitizeAcademicMode(settings.academicMode || ""),
+    simulatorConfig: sanitizeSimulatorConfigForStorage(settings.simulatorConfig),
     questionTypes: normalizeQuestionTypesForStorage(settings.questionTypes),
     serverUrl: sanitizeUrl(settings.serverUrl || "")
   };
   return stripSensitiveSettings(clean);
+}
+
+function sanitizeSimulatorConfigForStorage(value) {
+  const input = value && typeof value === "object" ? value : {};
+  const sanitizeIds = (items, max = 8) => (Array.isArray(items) ? items : [])
+    .map((item) => String(item || "").trim())
+    .filter((item, index, list) => /^[a-z_]{2,60}$/.test(item) && list.indexOf(item) === index)
+    .slice(0, max);
+  return {
+    strategy: input.strategy === "focused" ? "focused" : "balanced",
+    preicfesAreas: sanitizeIds(input.preicfesAreas, 5),
+    presaberproModules: sanitizeIds(input.presaberproModules, 6),
+    specificModule: sanitizeText(input.specificModule || "", { maxLength: 160 })
+  };
 }
 
 function sanitizeAccessListForStorage(list) {
@@ -930,8 +986,24 @@ function sanitizeQuestionForStorage(question) {
     isCorrect: Boolean(question.isCorrect ?? true),
     rationale,
     explanation: rationale,
-    hint: sanitizeText(question.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true })
+    hint: sanitizeText(question.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true }),
+    area: sanitizeText(question.area || "", { maxLength: 120 }),
+    competency: sanitizeText(question.competency || "", { maxLength: 240 }),
+    module: sanitizeText(question.module || "", { maxLength: 160 })
   };
+
+  if (type === "open_response") {
+    const rubric = (Array.isArray(question.rubric) ? question.rubric : [])
+      .map((criterion) => sanitizeText(criterion || "", { maxLength: 300 }))
+      .filter(Boolean)
+      .slice(0, 6);
+    if (rubric.length < 2) return null;
+    return {
+      ...base,
+      expectedResponse: sanitizeText(question.expectedResponse || question.correctAnswer || "", { maxLength: 1200, multiline: true }),
+      rubric
+    };
+  }
 
   if (type === "matching") {
     const pairs = (Array.isArray(question.pairs) ? question.pairs : [])
@@ -1001,7 +1073,10 @@ function sanitizeQuestionForStudent(question) {
     question: sanitizeText(question.question || "", { maxLength: INPUT_LIMITS.question, multiline: true }),
     type,
     difficulty: sanitizeDifficulty(question.difficulty),
-    hint: sanitizeText(question.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true })
+    hint: sanitizeText(question.hint || "", { maxLength: INPUT_LIMITS.shortText, multiline: true }),
+    area: sanitizeText(question.area || "", { maxLength: 120 }),
+    competency: sanitizeText(question.competency || "", { maxLength: 240 }),
+    module: sanitizeText(question.module || "", { maxLength: 160 })
   };
   if (type === "matching") {
     clean.pairs = (question.pairs || []).map((pair) => ({ left: sanitizeText(pair.left || "", { maxLength: 300 }) })).filter((pair) => pair.left);
@@ -1009,6 +1084,9 @@ function sanitizeQuestionForStudent(question) {
     return clean;
   }
   if (type === "fill_blank") {
+    return clean;
+  }
+  if (type === "open_response") {
     return clean;
   }
   clean.options = Array.isArray(question.options) ? question.options.map(sanitizeOptionForStudent).filter(Boolean) : [];

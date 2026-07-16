@@ -97,7 +97,7 @@ const INPUT_LIMITS = {
   prompt: 900000,
   url: 900
 };
-const ACADEMIC_MODES = ["institutional", "preicfes", "presaberpro"];
+const ACADEMIC_MODES = ["institutional"];
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 function normalizeCorsOrigin(origin) {
@@ -592,37 +592,11 @@ function sanitizeDifficulty(value) {
 }
 
 function sanitizeAcademicMode(value) {
-  const clean = String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "");
-  const aliases = {
-    examen: "institutional",
-    institucional: "institutional",
-    institution: "institutional",
-    institutional: "institutional",
-    saber11: "preicfes",
-    saber_11: "preicfes",
-    "saber-11": "preicfes",
-    icfes: "preicfes",
-    preicfes: "preicfes",
-    pre_icfes: "preicfes",
-    "pre-icfes": "preicfes",
-    saberpro: "presaberpro",
-    saber_pro: "presaberpro",
-    "saber-pro": "presaberpro",
-    presaberpro: "presaberpro",
-    pre_saber_pro: "presaberpro",
-    "pre-saber-pro": "presaberpro"
-  };
-  return aliases[clean] || (ACADEMIC_MODES.includes(clean) ? clean : "institutional");
+  return "institutional";
 }
 
 function normalizeAcademicModes(value) {
-  const raw = Array.isArray(value)
-    ? value
-    : String(value || "").split(/[,\s;/|]+/).filter(Boolean);
-  const modes = raw
-    .map(sanitizeAcademicMode)
-    .filter((mode, index, list) => ACADEMIC_MODES.includes(mode) && list.indexOf(mode) === index);
-  return modes.length ? modes : [...ACADEMIC_MODES];
+  return ["institutional"];
 }
 
 function sanitizeUrl(value) {
@@ -639,7 +613,7 @@ function sanitizeUrl(value) {
 }
 
 function normalizeQuestionTypesForStorage(value) {
-  const allowed = new Set(["multiple_choice", "true_false", "matching", "fill_blank", "open_response"]);
+  const allowed = new Set(["multiple_choice", "true_false", "matching", "fill_blank"]);
   const selected = (Array.isArray(value) ? value : [])
     .map((type) => String(type || "").trim())
     .filter((type) => allowed.has(type));
@@ -918,7 +892,7 @@ function verifyResultEntry(session, entry) {
 
 function normalizeQuestionType(type) {
   const clean = String(type || "").trim();
-  return ["multiple_choice", "true_false", "matching", "fill_blank", "open_response"].includes(clean) ? clean : "multiple_choice";
+  return ["multiple_choice", "true_false", "matching", "fill_blank"].includes(clean) ? clean : "multiple_choice";
 }
 
 function sanitizeOptionText(option) {
@@ -934,8 +908,7 @@ function sanitizeSettingsForStorage(settings = {}) {
     answerSeconds: clamp(Number(settings.answerSeconds) || 20, 5, 3600),
     questionTotal: clamp(Number(settings.questionTotal) || 10, 1, MAX_EXAM_PACKAGE_QUESTIONS),
     difficulty: sanitizeDifficulty(settings.difficulty),
-    academicMode: sanitizeAcademicMode(settings.academicMode || ""),
-    simulatorConfig: sanitizeSimulatorConfigForStorage(settings.simulatorConfig),
+    academicMode: "institutional",
     questionTypes: normalizeQuestionTypesForStorage(settings.questionTypes),
     serverUrl: sanitizeUrl(settings.serverUrl || "")
   };
@@ -974,7 +947,8 @@ function sanitizeAccessListForStorage(list) {
 
 function sanitizeQuestionForStorage(question) {
   if (!question || typeof question !== "object") return null;
-  const type = normalizeQuestionType(question.type);
+  const type = String(question.type || "multiple_choice").trim();
+  if (!["multiple_choice", "true_false", "matching", "fill_blank"].includes(type)) return null;
   const cleanQuestion = sanitizeText(question.question || "", { maxLength: INPUT_LIMITS.question, multiline: true });
   if (!cleanQuestion) return null;
 
@@ -1068,7 +1042,8 @@ function sanitizeExamPackageForStorage(examPackage, tenantId, sessionId) {
 }
 
 function sanitizeQuestionForStudent(question) {
-  const type = normalizeQuestionType(question?.type);
+  const type = String(question?.type || "multiple_choice").trim();
+  if (!["multiple_choice", "true_false", "matching", "fill_blank"].includes(type)) return null;
   const clean = {
     question: sanitizeText(question.question || "", { maxLength: INPUT_LIMITS.question, multiline: true }),
     type,
@@ -1113,9 +1088,10 @@ function stripSensitiveSettings(settings = {}) {
 function sanitizeExamPackageForStudent(examPackage) {
   return {
     ...examPackage,
+    academicMode: "institutional",
     settings: stripSensitiveSettings(sanitizeSettingsForStorage(examPackage.settings || {})),
     allowedAccess: sanitizeAccessListForStorage(examPackage.allowedAccess || []),
-    questionBank: (examPackage.questionBank || []).map(sanitizeQuestionForStudent).filter((question) => question.question)
+    questionBank: (examPackage.questionBank || []).map(sanitizeQuestionForStudent).filter((question) => question?.question)
   };
 }
 

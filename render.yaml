@@ -1,31 +1,110 @@
-services:
-  - type: web
-    name: evapro-server
-    runtime: node
-    buildCommand: npm install
-    startCommand: npm start
-    envVars:
-      - key: PORT
-        value: 3000
-      - key: CLAUDE_API_KEY
-        sync: false
-      - key: CLAUDE_MODELS
-        value: "claude-sonnet-4-6,claude-sonnet-4-5-20250929,claude-haiku-4-5-20251001"
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GEMINI_MODELS
-        value: "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
-      - key: ADMIN_SECRET
-        sync: false
-      - key: EVAPRO_DATA_FILE
-        value: /tmp/evapro-store.json
-      - key: JSON_BODY_LIMIT
-        value: "70mb"
-      - key: MAX_AI_FILE_BYTES
-        value: "47185920"
-      - key: MAX_AI_INLINE_FILE_BYTES
-        value: "47185920"
-      - key: GEMINI_INLINE_TOTAL_LIMIT
-        value: "18874368"
-      - key: ALLOWED_ORIGINS
-        value: "https://evaluapro-utch.netlify.app,https://cartografia-examen.netlify.app"
+# EVALUAPRO-UTCH - Servidor Render
+
+Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docentes autorizados.
+
+## Variables de entorno
+
+| Variable | Requerida | Descripcion |
+|---|---|---|
+| `PORT` | No | Puerto del servidor. Render lo asigna automaticamente. |
+| `ADMIN_SECRET` | Si | Clave privada del administrador. Debe ser larga y aleatoria. |
+| `ALLOWED_ORIGINS` | No | URLs adicionales permitidas, separadas por coma. `https://evaluapro-utch.netlify.app` ya viene permitido por defecto. |
+| `ALLOW_FILE_ORIGIN` | No | Solo desarrollo: permite origen `file:///` cuando vale `"true"`. Siempre se ignora en produccion. |
+| `DEV_OPEN_ACCESS` | No | Solo desarrollo: abre endpoints protegidos cuando vale `"true"`. Se ignora con `NODE_ENV=production`. |
+| `DATABASE_URL` | Obligatoria en produccion | Cadena de conexion PostgreSQL. El proceso aplica migraciones ordenadas antes de escuchar trafico. |
+| `SUPABASE_DATABASE_URL` | No | Alias de `DATABASE_URL`, por si prefieres nombrarla explicitamente. |
+| `DATABASE_POOL_MAX` | No | Maximo de conexiones PostgreSQL. Por defecto `5`. |
+| `EVAPRO_DATA_FILE` | No | Ruta del archivo JSON persistente. Ejemplo: `/tmp/evapro-store.json`. |
+| `JSON_BODY_LIMIT` | No | Limite del cuerpo JSON. Por defecto seguro `2mb`; amplialo expresamente solo si se requieren adjuntos IA. |
+| `MAX_AI_FILE_BYTES` | No | Tamano maximo total de PDF/imagenes aceptados para Gemini. Por defecto 45 MB. |
+| `MAX_AI_INLINE_FILE_BYTES` | No | Alias compatible de `MAX_AI_FILE_BYTES`. |
+| `GEMINI_INLINE_TOTAL_LIMIT` | No | Tamano maximo que se envia inline a Gemini; por encima se usa subida temporal. Por defecto 18 MB. |
+| `CLAUDE_API_KEY` | No | Clave Claude para generacion IA desde backend y fallback de YouTube. |
+| `GEMINI_API_KEY` | No | Clave Gemini para generacion IA desde backend. |
+| `CLAUDE_MODELS` | No | Lista de modelos Claude separados por coma. Por defecto usa `claude-sonnet-4-6`, `claude-sonnet-4-5-20250929`, `claude-haiku-4-5-20251001`. |
+| `GEMINI_MODELS` | No | Lista de modelos Gemini separados por coma. Por defecto usa `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.0-flash`. |
+
+## Seguridad aplicada
+
+- El servidor recalcula `score`, `percent` y `grade`; no confia en la nota enviada por el navegador.
+- Produccion falla al arrancar si falta `ADMIN_SECRET`; el acceso abierto requiere `DEV_OPEN_ACCESS=true` y nunca opera en produccion.
+- Los secretos se aceptan solo en encabezados. WebSocket usa tickets aleatorios, de un solo uso y 30 segundos.
+- Se rechazan resultados si no hay examen publicado o respuestas verificables; el acuse del estudiante no incluye respuestas ni claves.
+- El paquete que descarga el estudiante no incluye `correct`, `correctAnswer`, `acceptedAnswers` ni `rationale`.
+- Publicar examenes, consultar/borrar resultados y abrir WebSocket admin requiere `ADMIN_SECRET` o token docente valido del tenant.
+- Los estudiantes solo descargan el examen seguro y envian respuestas.
+- Los examenes, docentes, resultados y cierres se guardan en Supabase/Postgres si `DATABASE_URL` esta configurada. Si no, se usa `EVAPRO_DATA_FILE` como respaldo JSON.
+- El servidor elimina claves IA de los paquetes antes de almacenarlos.
+- `POST /api/ai/generate` permite usar claves IA desde variables de entorno de Render con `ADMIN_SECRET` o token docente valido.
+- Gemini puede recibir PDF o imagenes compatibles desde el frontend para generar cuando el texto editable/OCR sea insuficiente. Si superan el limite inline, el servidor usa subida temporal a Gemini.
+- CORS permite por defecto `https://evaluapro-utch.netlify.app` y los dominios extra definidos en `ALLOWED_ORIGINS`.
+- Se aplica rate limiting y limites de tamano/cantidad para reducir abuso.
+
+## Configuracion en Render
+
+1. Crea un Web Service en Render.
+2. Conecta el repositorio del servidor.
+3. Build command: `npm install`.
+4. Start command: `npm start`.
+5. En Environment agrega:
+   - `ADMIN_SECRET`: genera una clave larga.
+   - `ALLOWED_ORIGINS`: opcional para dominios extra. El dominio `https://evaluapro-utch.netlify.app` ya queda permitido por defecto.
+   - `DATABASE_URL`: cadena de conexion PostgreSQL de Supabase. Recomendado: usar la conexion pooler/transaction de Supabase para servicios web.
+   - `EVAPRO_DATA_FILE`: por ejemplo `/tmp/evapro-store.json`.
+   - `JSON_BODY_LIMIT`: por ejemplo `70mb`.
+   - `MAX_AI_FILE_BYTES`: por ejemplo `47185920`.
+   - `GEMINI_INLINE_TOTAL_LIMIT`: por ejemplo `18874368`.
+   - `CLAUDE_API_KEY`: opcional.
+   - `GEMINI_API_KEY`: opcional.
+   - `CLAUDE_MODELS` / `GEMINI_MODELS`: opcionales para cambiar el orden de modelos.
+
+Para persistencia institucional fuerte, usa `DATABASE_URL` con Supabase. `/tmp` puede perderse si Render recrea el servicio.
+
+## Configuracion con Supabase
+
+1. Crea un proyecto en Supabase.
+2. En el dashboard del proyecto, abre `Connect` o `Project Settings > Database`.
+3. Copia la cadena de conexion PostgreSQL tipo pooler/transaction.
+4. En Render, agrega esa cadena como `DATABASE_URL`.
+5. Despliega nuevamente el servidor.
+
+El servidor aplica una sola vez los archivos ordenados de `migrations/`, registrando su version en `evapro_schema_migrations` y serializando despliegues concurrentes con un advisory lock. El DDL de negocio no se ejecuta desde handlers ni rutinas de persistencia.
+
+- `evapro_sessions`: sesiones, paquetes de examen, resultados y cierres.
+- `evapro_teacher_registries`: listados de docentes autorizados por administrador.
+
+Tambien puedes ver o ejecutar manualmente la estructura en `supabase-schema.sql`.
+
+El endpoint `/` muestra `storage: "postgres"` cuando Supabase esta activo. Si muestra `storage: "json"`, Render no pudo conectarse a Supabase y esta usando el respaldo local.
+
+## Endpoints
+
+| Metodo | Ruta | Auth |
+|---|---|---|
+| `GET` | `/` | Publica |
+| `GET` | `/readyz` | Readiness de almacenamiento/migraciones |
+| `GET` | `/api/auth/me` | Revalida la cookie; 401 al revocar o retirar docente |
+| `POST` | `/api/auth/logout` | Revoca la sesion en la autoridad compartida |
+| `GET` | `/api/attempt/exam` | Capacidad de intento en `Authorization` |
+| `POST` | `/api/exam/:sessionId` | `ADMIN_SECRET` o token docente |
+| `POST` | `/api/attempt/capability` | Emite capacidad efimera ligada a tenant, sesion, documento y version |
+| `POST` | `/api/attempt/submit` | Capacidad; finalizacion normal idempotente |
+| `POST` | `/api/attempt/closure` | Capacidad; cierre exclusivo por anomalia |
+| `GET` | `/api/results/:sessionId` | `ADMIN_SECRET` o token docente |
+| `POST` | `/api/attempt/status` | Capacidad; documento fuera de URL |
+| `DELETE` | `/api/results/:sessionId` | `ADMIN_SECRET` o token docente |
+| `POST` | `/api/teachers/:adminId` | `ADMIN_SECRET` |
+| `POST` | `/api/teacher-access/:adminId` | Token docente en `x-teacher-token` |
+| `POST` | `/api/ws-ticket` | `ADMIN_SECRET` o token docente |
+| `POST` | `/api/ai/generate` | `ADMIN_SECRET` o token docente |
+| `GET` | `/api/youtube/transcript` | Publica con rate limit |
+
+## Pruebas
+
+Ejecuta `npm test`. Sin PostgreSQL real, la integracion se marca `SKIP` localmente. En CI institucional configure `TEST_DATABASE_URL` y ejecute `npm run test:postgres`; el comando falla si la base no existe. `REQUIRE_POSTGRES_TESTS=true npm test` tambien convierte la ausencia de PostgreSQL en fallo. La integracion arranca dos procesos y cubre migraciones concurrentes, autenticacion/logout compartidos, retirada docente fresca, unicidad terminal, rollback y RLS.
+
+## Contrato seguro de intentos
+
+Configure `ATTEMPT_CAPABILITY_SECRET` con alta entropia en produccion. Los endpoints antiguos de examen, estado, resultado y cierre responden `410 Gone`; todas las respuestas API usan `Cache-Control: no-store`. El cliente no muestra nota ni revision hasta recibir `receiptId` con `verifiedByServer`, y conserva un terminal pendiente para recuperacion/reintento.
+
+Para Postgres aplique `migrations/002_normalized_attempts.sql`. Su clave primaria hace mutuamente excluyentes `submit` y `closure` por intento. En desarrollo, JSON se escribe a temporal y se reemplaza con rename atomico; un fallo de persistencia se propaga y evita el 2xx.

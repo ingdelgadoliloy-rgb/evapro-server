@@ -1,3 +1,16 @@
-node_modules/
-.env
-*.log
+{
+  "name": "evapro-server",
+  "version": "1.0.0",
+  "description": "Servidor de resultados en tiempo real para EVALUAPRO-UTCH",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "pg": "^8.22.0",
+    "ws": "^8.16.0"
+  }
+}

@@ -1,5 +1,7 @@
 # EVALUAPRO-UTCH - Servidor Render
 
+> En el monorepo, esta aplicacion vive en `apps/api`. Para Render conectado a Git, usa el `render.yaml` de la raiz y configura `apps/api` como **Root Directory**. El archivo `render.yaml` de esta carpeta se conserva para el paquete ZIP individual de Render.
+
 Servidor REST + WebSocket para sincronizar examenes, resultados, cierres y docentes autorizados.
 
 ## Variables de entorno
